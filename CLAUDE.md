@@ -47,7 +47,7 @@ Release: `.\scripts\release.ps1` (x64 + x86, zip y SHA256 en `dist\`; con `-Publ
   `_mcp_created`), siempre con respaldo; respaldar `MASTER.DBF` antes de tocarlo. Cambiar `Run=` del citect.ini solo
   con respaldo fechado y OK del usuario. Nunca escribir contraseñas.
 - Es un SCADA eléctrico: nunca escribir tags ni reconocer alarmas sin confirmación explícita del usuario.
-- PLC reales (Modbus TCP): solo lecturas (FC1�FC4); el MCP no tiene escrituras Modbus y no hay que agregarlas.
+- PLC reales (Modbus TCP): solo lecturas (FC1–FC4); el MCP no tiene escrituras Modbus y no hay que agregarlas.
 - No restaurar backups `.ctz` para crear proyectos. Preguntar antes de cerrar Studio o Graphics Builder.
 - No cargar `ctExplor.dll` en ningún proceso (Assembly.LoadFile, etc.): Studio reescribió `Run=` del citect.ini
   (visto el 2026-10-16 06:41). Tampoco reiniciar Studio sin OK del usuario (`po_studio_set_project restart_studio=true`).

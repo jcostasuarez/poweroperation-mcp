@@ -41,6 +41,15 @@ function Invoke-Native {
     if ($LASTEXITCODE -ne 0) { throw "Falló: $Exe $($Arguments -join ' ') (código $LASTEXITCODE)" }
 }
 
+# Corre un comando y devuelve su salida (stdout + stderr, recortada) y su código, sin cortar el script.
+function Get-Native {
+    param([string]$Exe, [string[]]$Arguments)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $out = & $Exe @Arguments 2>&1 | ForEach-Object { "$_" } } finally { $ErrorActionPreference = $prev }
+    [pscustomobject]@{ Code = $LASTEXITCODE; Text = (($out | Out-String).Trim()) }
+}
+
 foreach ($tool in 'cargo', 'rustup') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         throw "No se encontró '$tool' en el PATH. Instalar Rust desde https://rustup.rs (toolchain MSVC)."
@@ -83,15 +92,16 @@ Step "$Name $Version"
 # --- Chequeos previos para publicar (antes de compilar, para fallar rápido) ---
 if ($Publish) {
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "No se encontró 'gh' (GitHub CLI)." }
-    $dirty = git status --porcelain
-    if ($dirty) { throw "Hay cambios sin commitear; commitear antes de publicar:`n$dirty" }
+    # Si git falla (p. ej. "dubious ownership" en un disco de otro dueño) no hay que tomarlo como árbol limpio.
+    $dirty = Get-Native git @('status', '--porcelain')
+    if ($dirty.Code -ne 0) { throw "git status falló:`n$($dirty.Text)" }
+    if ($dirty.Text) { throw "Hay cambios sin commitear; commitear antes de publicar:`n$($dirty.Text)" }
     Invoke-Native git @('fetch', '--quiet', 'origin')
-    $branch = (git rev-parse --abbrev-ref HEAD).Trim()
-    $local = (git rev-parse HEAD).Trim()
-    $remote = (git rev-parse "origin/$branch" 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $local -ne $remote.Trim()) { throw "La rama '$branch' no está sincronizada con origin (hacer push primero)." }
-    gh release view $Tag *> $null
-    if ($LASTEXITCODE -eq 0) { throw "El release $Tag ya existe. Subir la versión en Cargo.toml." }
+    $branch = (Get-Native git @('rev-parse', '--abbrev-ref', 'HEAD')).Text
+    $local = (Get-Native git @('rev-parse', 'HEAD')).Text
+    $remote = Get-Native git @('rev-parse', "origin/$branch")
+    if ($remote.Code -ne 0 -or $local -ne $remote.Text) { throw "La rama '$branch' no está sincronizada con origin (hacer push primero)." }
+    if ((Get-Native gh @('release', 'view', $Tag)).Code -eq 0) { throw "El release $Tag ya existe. Subir la versión en Cargo.toml." }
     $global:LASTEXITCODE = 0
 }
 
@@ -159,7 +169,7 @@ Descomprimir en la VM, copiar ``.env.example`` como ``.env`` si hace falta y reg
 
 SHA256 (zip): ``$Hash``
 "@
-    $ghArgs = @('release', 'create', $Tag, $Zip, $ShaFile, '--title', "$Name $Version", '--notes', $notes, '--target', (git rev-parse HEAD).Trim())
+    $ghArgs = @('release', 'create', $Tag, $Zip, $ShaFile, '--title', "$Name $Version", '--notes', $notes, '--target', $local)
     if ($Draft) { $ghArgs += '--draft' }
     Invoke-Native gh $ghArgs
     Write-Host "Release $Tag publicado." -ForegroundColor Green
