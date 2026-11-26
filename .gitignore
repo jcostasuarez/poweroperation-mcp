@@ -1,0 +1,31 @@
+# Compilación de Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Configuración local (usar .env.example como plantilla)
+.env
+.env.*
+!.env.example
+
+# Paquete para entregar
+/dist/
+*.zip
+
+# Logs de auditoría
+*-audit.log
+
+# Editores y sistema operativo
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+
+# Proyecto de prueba del DLL falso
+/tests/fakectapi/target/
+/tests/fakectapi/Cargo.lock
+
+# Restos de una versión vieja de offline.py (ahora genera los datos en %TEMP%)
+/tests/e2e/fakeuser/

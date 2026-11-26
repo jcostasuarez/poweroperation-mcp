@@ -1,0 +1,11 @@
+[package]
+name = "fakectapi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "CtApi"
+crate-type = ["cdylib"]
+
+[dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
