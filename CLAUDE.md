@@ -2,12 +2,13 @@
 
 Servidor MCP (Rust + rmcp 3.5, stdio) para EcoStruxure Power Operation 2024 (AVEVA Plant SCADA 8.50 / Citect).
 Mismo stack y estilo que `..\ignition-mcp`. Se entrega como exe (`dist\poweroperation-mcp-<versión>.zip`).
-42 herramientas `po_*` (desde 0.3.0; antes sin prefijo): runtime por CtAPI (`src\tools\runtime.rs`), procesos y arranque del runtime (`src\tools\runadmin.rs`
+44 herramientas `po_*` (desde 0.3.0; antes sin prefijo): runtime por CtAPI (`src\tools\runtime.rs`), procesos y arranque del runtime (`src\tools\runadmin.rs`
 sobre `src\procs.rs`), proyecto offline por DBF/Cicode (`src\tools\project.rs`), escritura de tablas DBF
 (`src\tools\dbfwrite.rs` sobre `src\dbf.rs` y `src\ndx.rs`), creación de proyectos (`src\tools\projcreate.rs`),
 compilación (`src\tools\projadmin.rs`), proyecto activo de Studio (`src\tools\studio.rs`: UI Automation, citect.ini),
-Graphics Builder por COM (`src\tools\graphics.rs` sobre `src\gb.rs`) y la
-referencia para el agente (`src\tools\reference.md`, embebida), PLC por Modbus TCP solo lectura (`src\tools\plc.rs`
+Graphics Builder por COM (`src\tools\graphics.rs` sobre `src\gb.rs`), Advanced One-Line offline
+(`src\tools\oneline.rs` sobre `src\oneline.rs` y el lector de `.ctg` `src\ctg.rs`: formato deducido de páginas
+reales, ver su cabecera) y la referencia para el agente (`src\tools\reference.md`, embebida), PLC por Modbus TCP solo lectura (`src\tools\plc.rs`
 sobre `src\modbus.rs`) y `po_status` + sondeo de puentes (`src\tools\status.rs`). `src\argerr.rs` arma los errores
 de argumentos (campos válidos + esquema) desde `call_tool` en `src\server.rs`.
 

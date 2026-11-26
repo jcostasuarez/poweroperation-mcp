@@ -7,6 +7,46 @@ use std::io::{Read, Write};
 use common::{Checks, Mcp, fake_projects, json_of, temp_dir};
 use serde_json::json;
 
+/// Cadena con largo delante (u16) como en los .ctg.
+fn lp(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u16).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Genie colocado con el formato de PO 2024 (ver src/ctg.rs).
+fn lp_genie(library: &str, genie: &str, props: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = vec![0x78, 0x00, 0x18, 0x01];
+    lp(&mut out, &format!("{library}.{genie}.<ctm"));
+    out.extend_from_slice(&[0x01, 0x00, 0x02, 0, 0, 0, 0x0c, 0, 0, 0, 0x02, 0, 0, 0, 0x02, 0, 0, 0]);
+    let mut block = (props.len() as u16).to_le_bytes().to_vec();
+    for (k, v) in props {
+        lp(&mut block, k);
+        lp(&mut block, v);
+    }
+    out.extend_from_slice(&((block.len() + 11) as u16).to_le_bytes());
+    out.extend_from_slice(&block);
+    out.extend_from_slice(&[0x02, 0, 0, 0, 0x01, 0, 0, 0, 0x80, 0, 0]);
+    out
+}
+
+/// Animación con una expresión ya expandida.
+fn lp_anim(expr: &str) -> Vec<u8> {
+    let mut out = vec![0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x49, 0x00, 0x01, 0x00];
+    lp(&mut out, "COL_A");
+    lp(&mut out, expr);
+    out
+}
+
+fn oneline_page(parts: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = b"\x00\x00attributes\x00".to_vec();
+    lp(&mut out, "pls_ansi_cb_1.CB_Draw_1.<ctm#dd67fb98");
+    for p in parts {
+        out.extend_from_slice(&[0u8; 12]);
+        out.extend_from_slice(p);
+    }
+    out
+}
+
 /// PLC Modbus TCP falso: FC3/FC4 devuelven el número de registro (4001 = 0 para probar nonzero_only), FC1/FC2
 /// bits impares en 1; FC3 desde 9000 responde excepción 2. Atiende conexiones una tras otra.
 fn fake_plc() -> u16 {
@@ -76,7 +116,7 @@ fn offline_tools() {
         [
             "po_status", "po_reference", "po_project_list", "po_project_tables", "po_project_query", "po_project_search",
             "po_project_graphics", "po_cicode_files", "po_cicode_read", "po_cicode_check", "po_runtime_procs",
-            "po_runtime_screenshot", "po_studio_project", "po_plc_read",
+            "po_runtime_screenshot", "po_studio_project", "po_plc_read", "po_oneline_read", "po_oneline_validate",
         ]
         .iter()
         .all(|t| tools.iter().any(|x| x == t)),
@@ -90,7 +130,7 @@ fn offline_tools() {
         &all,
     );
     let gb = tools.iter().filter(|t| t.starts_with("po_gb_")).count();
-    c.check("GB: las 5 de lectura o ninguna", tools.len() == 14 + gb && (gb == 0 || gb == 5), &all);
+    c.check("GB: las 5 de lectura o ninguna", tools.len() == 16 + gb && (gb == 0 || gb == 5), &all);
 
     // Catálogo de librerías gráficas: sale de los archivos, sin Graphics Builder.
     for f in ["PO_Demo/Feeders.ctg", "PLS_Include/pls_controls.ctm", "PLS_Include/pls_lights.ctl", "PLS_Include/pls_style_1.ctt"] {
@@ -104,6 +144,37 @@ fn offline_tools() {
         t.contains("\"Feeders\"") && lib["genie_libraries"] == json!(["pls_controls"]) && lib["symbol_libraries"] == json!(["pls_lights"]) && lib["template_styles"] == json!(["pls_style_1"]),
         &t,
     );
+    // Advanced One-Line offline: dos interruptores con el mismo BkrNum y equipos distintos (uno de otra estación),
+    // barras 1 y 2, y una animación que quedó apuntando a zOL\Bkr7 (resto de una copia).
+    common::write_dbf(&root.join("PO_Demo/equip.dbf"), &[("NAME", 40)], &[&["EstA.Q1"], &["EstA.Q2"]]);
+    let page = oneline_page(&[
+        lp_genie("pls_gen_base_1", "Busbar_H", &[("BusbarNum", "1")]),
+        lp_genie("pls_gen_base_1", "Busbar_H", &[("BusbarNum", "2")]),
+        lp_genie("pls_ansi_cb_1", "CB_Draw_1", &[("AN", "40"), ("BkrNum", "12"), ("Equip", "EstA.Q1"), ("SrcBusbarNum", "1"), ("DestBusbarNum", "2")]),
+        lp_genie("pls_ansi_cb_1", "CB_Draw_1", &[("AN", "41"), ("BkrNum", "12"), ("Equip", "EstB.Q1"), ("SrcBusbarNum", "1"), ("DestBusbarNum", "2")]),
+        lp_anim("PLS_Bkr_Color_Bkr(7, zOL\\Bus1, zOL\\Bus2, zOL\\Bkr7)"),
+    ]);
+    std::fs::write(root.join("PO_Demo/EstA_Unifilar.ctg"), page).unwrap();
+    let (e, t) = mcp.call("po_oneline_read", json!({"pages": ["EstA_*"]}));
+    let j = if e { json!({}) } else { json_of(&t) };
+    let items = j["pages"][0]["items"].as_array().cloned().unwrap_or_default();
+    c.check(
+        "po_oneline_read: barras e interruptores con número, zOL, equipo y barras",
+        !e && j["counts"] == json!({"breaker": 2, "busbar": 2})
+            && items.iter().any(|i| i["zol"] == "zOL\\Bkr12" && i["equip"] == "EstB.Q1" && i["an"] == "41" && i["buses"]["DestBusbarNum"] == "2")
+            && j["pages"][0]["zol_refs"].as_array().is_some_and(|r| r.iter().any(|x| x == "zOL\\Bkr7")),
+        &t,
+    );
+    let (e, t) = mcp.call("po_oneline_validate", json!({"foreign": ["EstB"]}));
+    let j = if e { json!({}) } else { json_of(&t) };
+    let rules = &j["summary"]["by_rule"];
+    c.check(
+        "po_oneline_validate: repetido con equipos distintos, equipo inexistente, otra estación y resto de copia",
+        !e && rules["DuplicateBreaker"] == 1 && rules["InvalidEquipment"] == 1 && rules["ForeignReference"] == 1 && rules["StaleZolReference"] == 1
+            && j["findings"][0]["severity"] == "error",
+        &t,
+    );
+
     let (e, t) = mcp.call("po_gb_page_create", json!({"page": "Nueva"}));
     c.check("po_gb_page_create oculta en solo lectura, con el motivo", e && t.contains("no está disponible") && t.contains("POWEROP_ALLOW_WRITE"), &t);
 

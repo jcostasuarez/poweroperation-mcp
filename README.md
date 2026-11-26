@@ -24,6 +24,7 @@ puentes disponibles en ese momento y `po_status` dice cuáles están y por qué 
 | Compilar | `po_project_compile`* (errores de `errlog.dbf`; `refresh_page`) | STUDIO |
 | Proyecto activo de Studio | `po_studio_project` (lectura), `po_studio_set_project`* (con Studio abierto cambia en caliente por Graphics Builder si está abierto sin páginas; si no, `restart_studio=true`: ver `reference.md`, sección "Proyecto activo de Studio") | PROCESOS, STUDIO |
 | Cicode offline | `po_cicode_files`, `po_cicode_read`, `po_cicode_write`*, `po_cicode_check` | DISCO |
+| Advanced One-Line | `po_oneline_read` (objetos del unifilar por página: número/tag zOL, equipo, Active, barras), `po_oneline_validate` (zOL repetidos, equipos inexistentes, referencias a otra estación, restos de copias, AdvOneLine.csv); offline, sin Graphics Builder | DISCO |
 | Páginas gráficas | `po_gb_status`, `po_gb_library`, `po_gb_page_read`, `po_gb_page_thumbnail` (PNG), `po_gb_page_create`*, `po_gb_page_edit`*, `po_gb_page_delete`*, `po_gb_genie_read`, `po_gb_genie_create`*, `po_gb_genie_edit`*, `po_gb_genie_delete`* | GB (Graphics Builder instalado; `po_gb_status` lo abre) |
 | PLC | `po_plc_read` (Modbus TCP, **solo lectura** FC1–FC4, notación `%MW`/`%IW`/`%M`/`%I`) | MODBUS |
 

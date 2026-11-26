@@ -21,7 +21,7 @@ herramientas habilita u oculta). Si se llama a una oculta, no se ejecuta nada y 
 | Puente | Disponible cuando | Herramientas |
 |---|---|---|
 | (siempre) | — | `po_status`, `po_reference` |
-| DISCO | siempre (archivos del proyecto) | `po_project_list/tables/query/search/graphics`, `po_cicode_files/read/check` |
+| DISCO | siempre (archivos del proyecto) | `po_project_list/tables/query/search/graphics`, `po_cicode_files/read/check`, `po_oneline_read/validate` |
 | PROCESOS | siempre (Windows) | `po_runtime_procs`, `po_runtime_screenshot`, `po_studio_project` |
 | CTAPI | CtApi.dll encontrado y el cliente del runtime responde (`Time(1)` en ≤10 s) | `po_tag_read`, `po_tag_browse`, `po_ctapi_find`, `po_trend_query`, `po_alarm_list`, `po_cicode_run` |
 | ODBC | driver "Citect Alarm Driver" instalado y puerto del servidor de alarmas abierto | `po_alarm_sql` |
@@ -505,6 +505,43 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   (`po_studio_set_project` usa este mismo `ProjectSelect` para cambiar el activo de Studio en caliente). Si no se
   pudo restaurar (p. ej. la página quedó abierta porque falló el guardado), queda un aviso.
 - Las páginas toman los cambios del genie al abrirse (genies vinculados): editar el genie actualiza las páginas.
+
+### Advanced One-Line (`po_oneline_read`, `po_oneline_validate`; offline, solo lectura)
+
+- **Cómo está armado** (PO 2024, visto en PLS_Include y en `OneLineConfig.Business.dll`; **verificado** sobre la página
+  de ejemplo `PSO_Equipment/SingleLinesOverview_T300`): cada objeto del unifilar es un genie de PLS_Include
+  (`pls_ansi_*`, `pls_iec_*`, `pls_gen_*`, `pls_meter`, `pls_easergy`) con propiedades numéricas: `BkrNum`
+  (interruptor), `BusbarNum` (barra), `MtrNum` (medidor), `SrcNum` (fuente), `SrcBusbarNum`/`DestBusbarNum` (barras de
+  origen y destino); transferencias con `BkrNum1`/`BkrNum2`/`SrcBusbarNum1`/`SrcBusbarNum2`. `Equip` = equipo,
+  `Active` = condición de línea activa. Las animaciones usan tags del dispositivo `zOL`: `zOL\Bkr<BkrNum>`,
+  `zOL\Bus<N>`, `zOL\Mtr<N>`, `zOL\Src<N>` (p. ej. `PLS_Bkr_Color_Bkr(12, zOL\Bus3, zOL\Bus4, zOL\Bkr12)`), que escribe
+  `AdvOneLine.exe` según `AdvOneLine.csv` (lo genera la One-Line Configuration Utility, `OneLineConfig.exe`:
+  `Component,Condition,Bus1,Bus2` con `BKR<n>`, `SRC<n>`, `MTR<n>`, `XFR<n>` y colores `CLR<n>`).
+- Las herramientas leen los `.ctg` del disco **sin Graphics Builder**: ven genies ocultos y dentro de grupos, y las
+  expresiones ya expandidas. El formato `.ctg` no está documentado; el lector (`src/ctg.rs`) se probó contra ~1700
+  genies de las páginas de PLS_Include, PSO_Equipment, Library_Controls y MCP_Demo (todos leídos). Lo que no
+  reconozca va en `unparsed_genies`: no se adivina.
+- El tipo se deduce de las propiedades (no hay lista oficial): `BkrNum1/2` → ats, `BkrNum` → breaker, `MtrNum` →
+  meter, `SrcNum` → source (o transformer si además tiene origen y destino), solo `BusbarNum` → busbar. **Sin
+  verificar**: transformadores y ATS (no hay ejemplos en PO 2024 de fábrica). El `an` es la propiedad `AN` del genie
+  (los de PLS la tienen), no el AN del objeto en Graphics Builder.
+- Recorre el proyecto y sus incluidos salvo los de sistema y librerías (como la utilidad: System, Include,
+  PLS_Include, PSO_Equipment, Library_*...). `pages` filtra por nombre (`*`/`?`).
+- `po_oneline_validate` (errores primero):
+  - Repetidos (`DuplicateBreaker/Busbar/Meter/Source`): en la misma página = error; en varias páginas = error si el
+    equipo cambia (el color de uno muestra el estado del otro: típico de copiar una página sin renumerar) y
+    advertencia si es el mismo equipo (puede ser otra vista). Barras repetidas con el mismo equipo: info.
+  - `MissingId`/`InvalidId`, `SameSourceAndDestinationBus`, `InvalidSourceBus`/`InvalidDestinationBus` (no numérico),
+    `NoSourceOrDestinationBus`, `BusWithoutBusbar` (info: normal en una salida, como en la página de ejemplo).
+  - `InvalidEquipment` (no está en equip.dbf del proyecto e incluidos), `NoEquipment`, `NoLineActive`.
+  - `foreign: ["EstB_"]` → `ForeignReference` en cualquier propiedad que contenga ese texto (encuentra el `Active` o
+    el `DetailsFn` que quedó apuntando a otra estación, también en genies ocultos). `equip_prefix` →
+    `ForeignEquipment`. `UnknownTag`: tags con `\` de las propiedades que no están en variable.dbf.
+  - `StaleZolReference`: un `zOL\Bkr<N>`/`Mtr`/`Src` en las expresiones de la página sin ningún objeto de esa página
+    que lo defina (o un `zOL\Bus<N>` que no usa nadie): restos de una copia.
+  - Con `AdvOneLine.csv` en la carpeta del proyecto: `NotInCsv` (en páginas, no en el csv: regenerar con la utilidad) y
+    `CsvOrphan`. **Sin verificar** dónde lo guarda la utilidad (se busca en la carpeta del proyecto).
+- Clonar páginas con renumeración (`po_oneline_clone`) no existe todavía (issue #1).
 
 ## 6. PLC por Modbus TCP (solo lectura)
 

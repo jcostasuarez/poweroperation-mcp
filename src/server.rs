@@ -74,6 +74,7 @@ impl PowerOpServer {
             + Self::projcreate_router()
             + Self::dbfwrite_router()
             + Self::graphics_router()
+            + Self::oneline_router()
             + Self::plc_router()
             + Self::reference_router()
             + Self::studio_router()
