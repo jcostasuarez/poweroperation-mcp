@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::cicode;
-use crate::dbf::Dbf;
+use crate::dbf::{Dbf, MASKED, is_secret_field};
 use crate::project::{self, Project};
 use crate::server::{PowerOpServer, ToolResult, blocking, err};
 use crate::text::{decode, encode, filter_match, truncate};
@@ -148,6 +148,10 @@ fn query_table(projects: &[Project], p: &QueryParams) -> Result<Value> {
             let idx = dbf
                 .field_index(k)
                 .ok_or_else(|| anyhow!("La tabla {} no tiene el campo '{k}'. Campos: {}", p.table, field_names.join(", ")))?;
+            // Filtrar por un hash de contraseña permitiría adivinarlo por partes.
+            if is_secret_field(&dbf.fields[idx].name) {
+                bail!("El campo {k} es de contraseña: no se puede filtrar por él (su valor se muestra como {MASKED}).");
+            }
             conds.push((idx, v.as_str()));
         }
         let wanted: Option<Vec<usize>> = match &p.fields {
@@ -158,12 +162,13 @@ fn query_table(projects: &[Project], p: &QueryParams) -> Result<Value> {
             ),
             _ => None,
         };
+        let secret: Vec<bool> = dbf.fields.iter().map(|f| is_secret_field(&f.name)).collect();
         dbf.for_each(|rec, vals| {
             if !conds.iter().all(|(i, pat)| filter_match(pat, &vals[*i])) {
                 return true;
             }
             if let Some(t) = &p.text
-                && !vals.iter().any(|v| filter_match(t, v))
+                && !vals.iter().enumerate().any(|(i, v)| !secret[i] && filter_match(t, v))
             {
                 return true;
             }
@@ -180,7 +185,8 @@ fn query_table(projects: &[Project], p: &QueryParams) -> Result<Value> {
                 };
                 for i in idxs {
                     if wanted.is_some() || !vals[i].is_empty() {
-                        o.insert(dbf.fields[i].name.clone(), json!(vals[i]));
+                        let v = if secret[i] && !vals[i].is_empty() { MASKED } else { vals[i].as_str() };
+                        o.insert(dbf.fields[i].name.clone(), json!(v));
                     }
                 }
                 rows.push(Value::Object(o));
@@ -189,7 +195,7 @@ fn query_table(projects: &[Project], p: &QueryParams) -> Result<Value> {
         });
     }
     if !found_table {
-        bail!("No existe la tabla '{}' en {}. Usá project_tables para ver las disponibles.", p.table, projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "));
+        bail!("No existe la tabla '{}' en {}. Usá po_project_tables para ver las disponibles.", p.table, projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "));
     }
     Ok(json!({
         "table": p.table,
@@ -209,16 +215,18 @@ fn search(projects: &[Project], text: &str, cicode_too: bool, limit: usize) -> R
         for path in project::files_with_ext(&proj.path, "dbf") {
             let Ok(dbf) = Dbf::open(&path) else { continue };
             let table = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let secret: Vec<bool> = dbf.fields.iter().map(|f| is_secret_field(&f.name)).collect();
             dbf.for_each(|rec, vals| {
                 for (i, v) in vals.iter().enumerate() {
-                    if !v.is_empty() && filter_match(text, v) {
+                    // Los hash de contraseña no se buscan ni se muestran.
+                    if !secret[i] && !v.is_empty() && filter_match(text, v) {
                         total += 1;
                         if hits.len() < limit {
                             hits.push(json!({
                                 "project": proj.name, "table": table, "rec": rec,
                                 "field": dbf.fields[i].name, "value": v,
                                 // Primer campo no vacío: suele ser el nombre del objeto.
-                                "record_key": vals.iter().find(|x| !x.is_empty()),
+                                "record_key": vals.iter().enumerate().find(|(j, x)| !secret[*j] && !x.is_empty()).map(|(_, x)| x),
                             }));
                         }
                     }
@@ -263,18 +271,26 @@ fn valid_ci_name(file: &str) -> Result<String> {
     Ok(if f.to_lowercase().ends_with(".ci") { f.to_string() } else { format!("{f}.ci") })
 }
 
-fn backup(path: &Path) -> Result<PathBuf> {
+pub(super) fn backup(path: &Path) -> Result<PathBuf> {
     let dir = path.parent().context("sin carpeta")?.join("_mcp_backup");
     std::fs::create_dir_all(&dir)?;
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let dest = dir.join(format!("{}.{stamp}.bak", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    // Dos escrituras en el mismo segundo: sufijo -2, -3... para no pisar el respaldo del estado original.
+    let mut dest = dir.join(format!("{name}.{stamp}.bak"));
+    for n in 2.. {
+        if !dest.exists() {
+            break;
+        }
+        dest = dir.join(format!("{name}.{stamp}-{n}.bak"));
+    }
     std::fs::copy(path, &dest)?;
     Ok(dest)
 }
 
 #[tool_router(router = project_router, vis = "pub(crate)")]
 impl PowerOpServer {
-    #[tool(description = "Lista los proyectos de Power Operation encontrados en disco (carpetas User de ProgramData, citect.ini y POWEROP_PROJECTS_DIR), cuál corre en runtime y sus proyectos incluidos.")]
+    #[tool(name = "po_project_list", description = "Lista los proyectos de Power Operation encontrados en disco (carpetas User de ProgramData, citect.ini y POWEROP_PROJECTS_DIR), cuál corre en runtime y sus proyectos incluidos. En una carpeta User manda su MASTER.DBF: las carpetas no registradas salen aparte en unregistered_folders.")]
     async fn project_list(&self, Parameters(p): Parameters<ListParams>) -> ToolResult {
         let cat = self.catalog(p.refresh).await.map_err(err)?;
         let cat2 = cat.clone();
@@ -299,10 +315,10 @@ impl PowerOpServer {
             .map(|i| json!({"path": i.path, "run": i.get("CtEdit", "Run"), "user": i.get("CtEdit", "User")}))
             .collect();
         let runtime_project = self.runtime_project(false).await;
-        pretty(&json!({"default_project": self.cfg.default_project, "runtime_project": runtime_project, "citect_ini": inis, "searched_roots": cat.roots, "projects": projects}), 80_000)
+        pretty(&json!({"default_project": self.cfg.default_project, "runtime_project": runtime_project, "citect_ini": inis, "searched_roots": cat.roots, "user_folders_with_master_dbf": cat.masters, "projects": projects, "unregistered_folders": cat.unregistered}), 80_000)
     }
 
-    #[tool(description = "Tablas DBF de un proyecto con cantidad de registros y campos (nombre, tipo, largo). Útil para saber qué consultar con project_query.")]
+    #[tool(name = "po_project_tables", description = "Tablas DBF de un proyecto con cantidad de registros y campos (nombre, tipo, largo). Útil para saber qué consultar con po_project_query.")]
     async fn project_tables(&self, Parameters(p): Parameters<ProjectParam>) -> ToolResult {
         let proj = self.project(p.project.as_deref()).await.map_err(err)?;
         let dir = proj.path.clone();
@@ -326,7 +342,7 @@ impl PowerOpServer {
         pretty(&json!({"project": proj.name, "path": proj.path, "tables": tables}), 120_000)
     }
 
-    #[tool(description = "Consulta una tabla DBF del proyecto (variable = tags, digalm/anaalm/advalm = alarmas, trend, units = dispositivos I/O, equip, pages...) con filtros por campo, texto libre, paginación y opcionalmente en proyectos incluidos.")]
+    #[tool(name = "po_project_query", description = "Consulta una tabla DBF del proyecto (variable = tags, digalm/anaalm/advalm = alarmas, trend, units = dispositivos I/O, equip, pages...) con filtros por campo, texto libre, paginación y opcionalmente en proyectos incluidos.")]
     async fn project_query(&self, Parameters(p): Parameters<QueryParams>) -> ToolResult {
         let (projects, missing) = scope(self, p.project.as_deref(), p.include_included).await.map_err(err)?;
         let mut v = blocking(DISK_TIMEOUT, move || query_table(&projects, &p)).await.map_err(err)?;
@@ -336,7 +352,7 @@ impl PowerOpServer {
         pretty(&v, 120_000)
     }
 
-    #[tool(description = "Busca un texto (nombre de tag, función, dispositivo...) en TODAS las tablas DBF y archivos Cicode del proyecto. Sirve para saber dónde se usa algo.")]
+    #[tool(name = "po_project_search", description = "Busca un texto (nombre de tag, función, dispositivo...) en TODAS las tablas DBF y archivos Cicode del proyecto. Sirve para saber dónde se usa algo.")]
     async fn project_search(&self, Parameters(p): Parameters<SearchParams>) -> ToolResult {
         if p.text.trim().is_empty() {
             return Err("Indicá el texto a buscar".into());
@@ -348,7 +364,7 @@ impl PowerOpServer {
         pretty(&v, 120_000)
     }
 
-    #[tool(description = "Lista los archivos Cicode (.ci) del proyecto con las funciones que declara cada uno (nombre, línea, alcance, tipo de retorno).")]
+    #[tool(name = "po_cicode_files", description = "Lista los archivos Cicode (.ci) del proyecto con las funciones que declara cada uno (nombre, línea, alcance, tipo de retorno).")]
     async fn cicode_files(&self, Parameters(p): Parameters<CicodeFilesParams>) -> ToolResult {
         let (projects, _) = scope(self, p.project.as_deref(), p.include_included).await.map_err(err)?;
         let v = blocking(DISK_TIMEOUT, move || {
@@ -372,7 +388,7 @@ impl PowerOpServer {
         pretty(&v, 120_000)
     }
 
-    #[tool(description = "Lee un archivo Cicode (.ci) del proyecto (o de sus incluidos), completo o solo una función.")]
+    #[tool(name = "po_cicode_read", description = "Lee un archivo Cicode (.ci) del proyecto (o de sus incluidos), completo o solo una función.")]
     async fn cicode_read(&self, Parameters(p): Parameters<CicodeReadParams>) -> ToolResult {
         let (projects, _) = scope(self, p.project.as_deref(), true).await.map_err(err)?;
         blocking(DISK_TIMEOUT, move || {
@@ -409,7 +425,7 @@ impl PowerOpServer {
         .map_err(err)
     }
 
-    #[tool(description = "Crea o reemplaza un archivo Cicode (.ci) en la carpeta del proyecto (guarda copia en _mcp_backup y hace un chequeo estructural). Después hay que compilar en Power Operation Studio. Confirmá con el usuario. Requiere POWEROP_ALLOW_WRITE=1.")]
+    #[tool(name = "po_cicode_write", description = "Crea o reemplaza un archivo Cicode (.ci) en la carpeta del proyecto (guarda copia en _mcp_backup y hace un chequeo estructural). Después hay que compilar en Power Operation Studio. Confirmá con el usuario. Requiere POWEROP_ALLOW_WRITE=1.")]
     async fn cicode_write(&self, Parameters(p): Parameters<CicodeWriteParams>) -> ToolResult {
         self.require_write("cicode_write").map_err(err)?;
         let proj = self.project(p.project.as_deref()).await.map_err(err)?;
@@ -447,7 +463,7 @@ impl PowerOpServer {
         }
     }
 
-    #[tool(description = "Chequeo estructural de código Cicode sin compilar: bloques FUNCTION/IF/WHILE/FOR/SELECT CASE/REPEAT balanceados, paréntesis y cadenas; lista las funciones declaradas. No reemplaza compilar en Studio.")]
+    #[tool(name = "po_cicode_check", description = "Chequeo estructural de código Cicode sin compilar: bloques FUNCTION/IF/WHILE/FOR/SELECT CASE/REPEAT balanceados, paréntesis y cadenas; lista las funciones declaradas. No reemplaza compilar en Studio.")]
     async fn cicode_check(&self, Parameters(p): Parameters<CicodeCheckParams>) -> ToolResult {
         pretty(&serde_json::to_value(cicode::check(&p.code)).map_err(|e| e.to_string())?, 20_000)
     }
@@ -457,11 +473,11 @@ impl PowerOpServer {
 mod tests {
     use super::*;
     use crate::dbf::tests::build;
+    use crate::testutil::TempDir;
 
-    fn temp_project(name: &str) -> Project {
-        let dir = std::env::temp_dir().join(format!("pomcp-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    /// Proyecto temporal con variable.dbf (3 tags) y Breakers.ci. El TempDir lo borra al terminar.
+    fn temp_project(name: &str) -> (TempDir, Project) {
+        let dir = TempDir::new(&format!("proj-{name}"));
         std::fs::write(
             dir.join("variable.dbf"),
             build(
@@ -475,13 +491,14 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("Breakers.ci"), encode("// Abre\r\nINT FUNCTION BrkOpen(STRING s)\r\n  TagWrite(s, 0);\r\n  RETURN 0;\r\nEND\r\n")).unwrap();
-        Project { name: name.into(), path: dir, running: false }
+        let proj = Project { name: name.into(), path: dir.path().to_path_buf(), running: false };
+        (dir, proj)
     }
 
     #[test]
     fn query_and_search() {
-        let proj = temp_project("q");
-        let q = QueryParams {
+        let (_dir, proj) = temp_project("q");
+        let mut q = QueryParams {
             project: None,
             table: "Variable".into(),
             r#where: BTreeMap::from([("tag".into(), "Feeder1*".into())]),
@@ -492,10 +509,13 @@ mod tests {
             offset: None,
         };
         let v = query_table(std::slice::from_ref(&proj), &q).unwrap();
-        assert_eq!(v["matched"], 2);
-        assert_eq!(v["returned"], 1);
-        assert_eq!(v["more"], true);
+        assert_eq!((&v["matched"], &v["returned"], &v["more"]), (&json!(2), &json!(1), &json!(true)), "{v}");
         assert_eq!(v["rows"][0]["TAG"], "Feeder1\\MMXU1\\TotW");
+        // Segunda página: la última fila, sin más.
+        q.offset = Some(1);
+        let v = query_table(std::slice::from_ref(&proj), &q).unwrap();
+        assert_eq!((&v["returned"], &v["more"]), (&json!(1), &json!(false)), "{v}");
+        assert_eq!(v["rows"][0]["TAG"], "Feeder1\\XCBR1\\Pos");
 
         let s = search(std::slice::from_ref(&proj), "XCBR1", true, 50).unwrap();
         assert_eq!(s["total_matches"], 1);
@@ -504,7 +524,73 @@ mod tests {
 
         let (_, path) = find_ci(std::slice::from_ref(&proj), "breakers").unwrap();
         assert!(path.ends_with("Breakers.ci"));
-        assert!(valid_ci_name("..\\x.ci").is_err());
-        let _ = std::fs::remove_dir_all(&proj.path);
+    }
+
+    /// po_cicode_write solo recibe un nombre de archivo: nada de carpetas ni unidades.
+    #[test]
+    fn ci_names_without_folders() {
+        assert_eq!(valid_ci_name(" Nuevo ").unwrap(), "Nuevo.ci");
+        assert_eq!(valid_ci_name("Feeders.CI").unwrap(), "Feeders.CI");
+        for bad in ["", "  ", "..\\x.ci", "../x.ci", "sub/x.ci", "C:x.ci", "a..b"] {
+            let e = valid_ci_name(bad).unwrap_err().to_string();
+            assert!(e.contains("sin carpetas"), "{bad:?}: {e}");
+        }
+    }
+
+    /// Dos respaldos del mismo archivo en el mismo segundo no se pisan: el primero guarda el estado original.
+    #[test]
+    fn backups_in_the_same_second_keep_the_original() {
+        let dir = TempDir::new("backup");
+        let f = dir.join("variable.dbf");
+        std::fs::write(&f, b"original").unwrap();
+        let b1 = backup(&f).unwrap();
+        std::fs::write(&f, b"cambio 1").unwrap();
+        let b2 = backup(&f).unwrap();
+        assert_ne!(b1, b2);
+        assert_eq!(std::fs::read(&b1).unwrap(), b"original");
+        assert_eq!(std::fs::read(&b2).unwrap(), b"cambio 1");
+        assert!(b1.starts_with(dir.join("_mcp_backup")));
+    }
+
+    #[test]
+    fn passwords_are_masked() {
+        let (_dir, proj) = temp_project("pw");
+        std::fs::write(
+            proj.path.join("users.dbf"),
+            build(&[("NAME", 16), ("PASSWORD", 40), ("SEED", 20), ("PWD_VER", 4)], &[(&["Operador", "AB12CD34", "S33D", ""], false)]),
+        )
+        .unwrap();
+        let mut q = QueryParams {
+            project: None,
+            table: "users".into(),
+            r#where: BTreeMap::new(),
+            text: None,
+            fields: None,
+            include_included: false,
+            limit: None,
+            offset: None,
+        };
+        let v = query_table(std::slice::from_ref(&proj), &q).unwrap();
+        let row = &v["rows"][0];
+        assert_eq!(row["NAME"], "Operador");
+        assert_eq!(row["PASSWORD"], MASKED);
+        assert_eq!(row["SEED"], MASKED);
+        assert!(row.get("PWD_VER").is_none(), "vacío: no se muestra");
+        assert!(!v.to_string().contains("AB12CD34") && !v.to_string().contains("S33D"), "{v}");
+        // Pedido explícito por fields: igual enmascarado; vacío sigue vacío.
+        q.fields = Some(vec!["password".into(), "seed".into(), "pwd_ver".into()]);
+        let v = query_table(std::slice::from_ref(&proj), &q).unwrap();
+        assert_eq!(v["rows"][0]["PASSWORD"], MASKED);
+        assert_eq!(v["rows"][0]["SEED"], MASKED);
+        assert_eq!(v["rows"][0]["PWD_VER"], "");
+        // No se puede adivinar el hash filtrando ni con texto libre.
+        q.fields = None;
+        q.r#where = BTreeMap::from([("password".into(), "AB*".into())]);
+        assert!(query_table(std::slice::from_ref(&proj), &q).is_err());
+        q.r#where = BTreeMap::new();
+        q.text = Some("AB12*".into());
+        assert_eq!(query_table(std::slice::from_ref(&proj), &q).unwrap()["matched"], 0);
+        assert_eq!(search(std::slice::from_ref(&proj), "AB12CD34", false, 50).unwrap()["total_matches"], 0);
+        assert_eq!(search(std::slice::from_ref(&proj), "Operador", false, 50).unwrap()["total_matches"], 1);
     }
 }

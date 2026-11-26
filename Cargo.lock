@@ -1101,9 +1101,10 @@ dependencies = [
 
 [[package]]
 name = "poweroperation-mcp"
-version = "0.1.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "dotenvy",
  "encoding_rs",
@@ -1116,6 +1117,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

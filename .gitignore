@@ -27,5 +27,5 @@ desktop.ini
 /tests/fakectapi/target/
 /tests/fakectapi/Cargo.lock
 
-# Restos de una versión vieja de offline.py (ahora genera los datos en %TEMP%)
-/tests/e2e/fakeuser/
+# Notas locales del entorno de desarrollo (VM): no se publican
+AGENT.md

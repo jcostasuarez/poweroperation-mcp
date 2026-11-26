@@ -22,12 +22,60 @@ pub struct Config {
     /// Tiempo máximo por llamada a CtAPI / ODBC.
     pub timeout: Duration,
     /// Dirección y puerto del servidor de alarmas (driver ODBC "Citect Alarm Driver").
-    pub alarm_host: String,
-    pub alarm_port: u16,
+    /// Vacíos = se toman del proyecto (tablas almsrv/netaddr) o localhost:5482.
+    pub alarm_host: Option<String>,
+    pub alarm_port: Option<u16>,
     /// Archivo SystemsXml propio (si no se indica, se genera uno con host/puerto).
     pub alarm_systems_xml: Option<PathBuf>,
     /// Log de auditoría de escrituras.
     pub audit_log: PathBuf,
+    /// PLCs Modbus TCP para po_plc_read (solo lectura). Vacío = puente MODBUS no configurado.
+    pub modbus: Vec<ModbusTarget>,
+    /// Segundos entre sondeos de los puentes CTAPI, ODBC y MODBUS (0 = solo al arrancar y con po_status).
+    pub probe_secs: u64,
+}
+
+/// Un PLC Modbus TCP de `POWEROP_MODBUS` (`nombre=host:puerto/unidad`; nombre, puerto y unidad opcionales).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModbusTarget {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub unit: u8,
+}
+
+impl std::fmt::Display for ModbusTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={}:{}/{}", self.name, self.host, self.port, self.unit)
+    }
+}
+
+/// Lee `POWEROP_MODBUS`: entradas separadas por `;` con la forma `[nombre=]host[:puerto][/unidad]`
+/// (puerto 502 y unidad 255 por defecto; sin nombre se usa `PLC1`, `PLC2`...).
+pub fn parse_modbus(v: &str) -> Result<Vec<ModbusTarget>, String> {
+    let mut out: Vec<ModbusTarget> = Vec::new();
+    for (i, item) in v.split(';').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+        let (name, rest) = match item.split_once('=') {
+            Some((n, r)) => (n.trim().to_string(), r.trim()),
+            None => (format!("PLC{}", i + 1), item),
+        };
+        let (addr, unit) = match rest.split_once('/') {
+            Some((a, u)) => (a, u.trim().parse::<u8>().map_err(|_| format!("unidad inválida en '{item}'"))?),
+            None => (rest, 255),
+        };
+        let (host, port) = match addr.rsplit_once(':') {
+            Some((h, p)) => (h.trim().to_string(), p.trim().parse::<u16>().map_err(|_| format!("puerto inválido en '{item}'"))?),
+            None => (addr.trim().to_string(), 502),
+        };
+        if host.is_empty() || name.is_empty() {
+            return Err(format!("entrada inválida '{item}' (forma: nombre=host:puerto/unidad)"));
+        }
+        if out.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
+            return Err(format!("nombre de PLC repetido: {name}"));
+        }
+        out.push(ModbusTarget { name, host, port, unit });
+    }
+    Ok(out)
 }
 
 impl Config {
@@ -67,10 +115,19 @@ impl Config {
             default_project: var("POWEROP_PROJECT"),
             allow_write: flag("POWEROP_ALLOW_WRITE"),
             timeout: Duration::from_secs(var("POWEROP_TIMEOUT_SECS").and_then(|v| v.parse().ok()).unwrap_or(30)),
-            alarm_host: var("POWEROP_ALARM_HOST").unwrap_or_else(|| "127.0.0.1".into()),
-            alarm_port: var("POWEROP_ALARM_PORT").and_then(|v| v.parse().ok()).unwrap_or(5482),
+            alarm_host: var("POWEROP_ALARM_HOST"),
+            alarm_port: var("POWEROP_ALARM_PORT").and_then(|v| v.parse().ok()),
             alarm_systems_xml: var("POWEROP_ALARM_SYSTEMS_XML").map(PathBuf::from),
             audit_log,
+            modbus: var("POWEROP_MODBUS")
+                .map(|v| {
+                    parse_modbus(&v).unwrap_or_else(|e| {
+                        tracing::warn!("POWEROP_MODBUS ignorado: {e}");
+                        vec![]
+                    })
+                })
+                .unwrap_or_default(),
+            probe_secs: var("POWEROP_PROBE_SECS").and_then(|v| v.parse().ok()).unwrap_or(30),
         }
     }
 
@@ -80,7 +137,8 @@ impl Config {
         format!(
             "POWEROP_CTAPI={}\nPOWEROP_HOST={}\nPOWEROP_USER={}\nPOWEROP_PASSWORD={}\nPOWEROP_CLUSTER={}\n\
              POWEROP_PROJECTS_DIR={}\nPOWEROP_PROJECT={}\nPOWEROP_ALLOW_WRITE={}\nPOWEROP_TIMEOUT_SECS={}\n\
-             POWEROP_ALARM_HOST={}:{}\nPOWEROP_ALARM_SYSTEMS_XML={}\nPOWEROP_AUDIT_LOG={}",
+             POWEROP_ALARM_HOST={}\nPOWEROP_ALARM_PORT={}\nPOWEROP_ALARM_SYSTEMS_XML={}\nPOWEROP_AUDIT_LOG={}\n\
+             POWEROP_MODBUS={}\nPOWEROP_PROBE_SECS={}",
             self.ctapi_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(auto)".into()),
             self.host.clone().unwrap_or_else(|| "(local)".into()),
             opt(&self.user),
@@ -94,10 +152,32 @@ impl Config {
             opt(&self.default_project),
             if self.allow_write { "1 (escrituras habilitadas)" } else { "0 (solo lectura)" },
             self.timeout.as_secs(),
-            self.alarm_host,
-            self.alarm_port,
+            self.alarm_host.clone().unwrap_or_else(|| "(auto: proyecto o localhost)".into()),
+            self.alarm_port.map(|p| p.to_string()).unwrap_or_else(|| "(auto: proyecto o 5482)".into()),
             self.alarm_systems_xml.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(auto)".into()),
             self.audit_log.display(),
+            if self.modbus.is_empty() {
+                "(no)".into()
+            } else {
+                self.modbus.iter().map(ToString::to_string).collect::<Vec<_>>().join(";")
+            },
+            self.probe_secs,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modbus_por_defecto_y_completo() {
+        let t = parse_modbus("192.0.2.10").unwrap();
+        assert_eq!(t, vec![ModbusTarget { name: "PLC1".into(), host: "192.0.2.10".into(), port: 502, unit: 255 }]);
+        let t = parse_modbus("PLC1=192.0.2.10:5020/1; 192.0.2.11").unwrap();
+        assert_eq!(t[0], ModbusTarget { name: "PLC1".into(), host: "192.0.2.10".into(), port: 5020, unit: 1 });
+        assert_eq!(t[1].name, "PLC2");
+        assert!(parse_modbus("A=x:99999").is_err());
+        assert!(parse_modbus("A=x;A=y").is_err());
     }
 }

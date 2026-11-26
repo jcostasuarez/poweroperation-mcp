@@ -43,7 +43,8 @@ pub unsafe extern "system" fn ctTagRead(h: *mut c_void, tag: *const c_char, buf:
         "Feeder1\\MMXU1\\TotW" => "1234.5".to_string(),
         "Feeder1\\XCBR1\\Pos" => POS.lock().unwrap().clone(),
         _ => {
-            unsafe { SetLastError(CT_ERR + 257) };
+            // Como PO 2024: tag inexistente = error 424 ("Tag not found").
+            unsafe { SetLastError(CT_ERR + 424) };
             return 0;
         }
     };
@@ -56,7 +57,7 @@ pub unsafe extern "system" fn ctTagWrite(_h: *mut c_void, tag: *const c_char, va
         *POS.lock().unwrap() = unsafe { s(val) };
         1
     } else {
-        unsafe { SetLastError(CT_ERR + 257) };
+        unsafe { SetLastError(CT_ERR + 424) };
         0
     }
 }
@@ -64,7 +65,12 @@ pub unsafe extern "system" fn ctTagWrite(_h: *mut c_void, tag: *const c_char, va
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn ctCicode(_h: *mut c_void, cmd: *const c_char, _w: u32, _m: u32, buf: *mut c_char, len: u32, _o: *mut c_void) -> u32 {
     let c = unsafe { s(cmd) };
-    let r = if c.starts_with("Time(") { "10:15:00".to_string() } else if c == "ProjectCurrentGet()" { "PO_Demo".into() } else if c.starts_with("AlarmAckTag(") { "0".into() } else { format!("eval:{c}") };
+    // Como PO 2024: ProjectCurrentGet() da error Citect 292 y el proyecto sale de ProjectInfo(0).
+    if c == "ProjectCurrentGet()" {
+        unsafe { SetLastError(CT_ERR + 292) };
+        return 0;
+    }
+    let r = if c.starts_with("Time(") { "10:15:00".to_string() } else if c == "ProjectInfo(0)" { "PO_Demo".into() } else if c.starts_with("AlarmAckTag(") { "0".into() } else { format!("eval:{c}") };
     unsafe { put(buf, len, &r) as u32 }
 }
 
@@ -74,28 +80,38 @@ fn kv(p: &[(&str, String)]) -> Vec<(String, String)> { p.iter().map(|(k, v)| (k.
 
 unsafe fn first(table: *const c_char, filter: *const c_char, pobj: *mut *mut c_void) -> *mut c_void {
     let (t, f) = unsafe { (s(table), s(filter)) };
+    // Como PO 2024: TYPE de la tabla Tag es un código (0 digital, 2 real), sin UNIT/ADDR.
     let rows: Vec<Vec<(String, String)>> = if t == "Tag" {
         let pre = f.strip_prefix("TAG=").unwrap_or("").trim_end_matches('*').to_string();
-        [("Feeder1\\MMXU1\\TotW", "REAL", "kW"), ("Feeder1\\XCBR1\\Pos", "DIGITAL", ""), ("Feeder2\\MMXU1\\TotW", "REAL", "kW")]
+        [("Feeder1\\MMXU1\\TotW", "2", "kW"), ("Feeder1\\XCBR1\\Pos", "0", ""), ("Feeder2\\MMXU1\\TotW", "2", "kW")]
             .iter()
             .filter(|r| r.0.starts_with(&pre))
-            .map(|r| kv(&[("TAG", r.0.into()), ("TYPE", r.1.into()), ("ENG_UNITS", r.2.into())]))
+            .map(|r| kv(&[("TAG", r.0.into()), ("TYPE", r.1.into()), ("ENG_UNITS", r.2.into()), ("CLUSTER", "c1".into())]))
             .collect()
     } else if let Some(q) = t.strip_prefix("TRNQUERY,") {
         assert!(filter.is_null(), "TRNQUERY debe ir con filtro NULL");
         let a: Vec<&str> = q.split(',').collect();
-        assert_eq!(a.len(), 9, "TRNQUERY con {} argumentos: {q}", a.len());
+        assert!(a.len() == 7 || a.len() == 9, "TRNQUERY con {} argumentos: {q}", a.len());
+        // Como PO 2024: InstantTrend=0 y SamplePeriod=0 al final se rechazan (error 274).
+        if a.len() == 9 && a[7] == "0" && a[8] == "0" {
+            unsafe { SetLastError(CT_ERR + 274) };
+            return std::ptr::null_mut();
+        }
         let end: i64 = a[0].parse().unwrap();
         let period: f64 = a[2].parse().unwrap();
         let n: usize = a[3].parse().unwrap();
+        // Como el servidor real: de la muestra más nueva a la más vieja.
         (0..n)
+            .rev()
             .map(|i| {
                 let secs = end - ((n - 1 - i) as f64 * period) as i64;
                 kv(&[("DATETIME", secs.to_string()), ("MSECONDS", "0".into()), ("VALUE", format!("{}", i as f64 * 1.5)), ("QUALITY", if i == 0 { "2".into() } else { "18".into() })])
             })
             .collect()
     } else if t == "Alarm" {
-        vec![kv(&[("TAG", "Feeder1_Trip".into()), ("NAME", "Disparo".into()), ("STATE", "ON".into())])]
+        vec![kv(&[("TAG", "Feeder1_Trip".into()), ("NAME", "Disparo".into()), ("STATE", "ON".into()), ("ALARMTYPE", "Digital".into())])]
+    } else if t == "AlarmSummary" {
+        vec![kv(&[("TAG", "Feeder1_Trip".into()), ("NAME", "Disparo".into()), ("ONTIME", "10:14:00".into()), ("OFFTIME", "10:14:10".into()), ("USERNAME", "System".into())])]
     } else {
         vec![]
     };

@@ -1,12 +1,21 @@
 mod alarmdb;
+mod argerr;
+mod bridges;
 mod cicode;
 mod config;
 mod ctapi;
 mod dbf;
 mod discover;
+mod ndx;
+mod gb;
+mod modbus;
+mod png;
+mod procs;
 mod project;
 mod server;
 mod text;
+#[cfg(test)]
+mod testutil;
 mod tools;
 
 use std::sync::Arc;
@@ -50,7 +59,17 @@ async fn main() -> Result<()> {
 
     let cfg = config::Config::load();
     tracing::info!(allow_write = cfg.allow_write, host = ?cfg.host, "iniciando poweroperation-mcp");
-    let service = server::PowerOpServer::new(cfg).serve(rmcp::transport::stdio()).await?;
+    let server = server::PowerOpServer::new(cfg);
+    // Primer sondeo de todos los puentes: se espera un poco para que la primera lista de herramientas ya los
+    // refleje; lo que tarde más (p. ej. buscar el compilador de Studio) se publica con tools/list_changed.
+    let first = tokio::spawn({
+        let s = server.clone();
+        async move { s.probe(&bridges::Bridge::ALL).await }
+    });
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(8), first).await;
+    let service = server.clone().serve(rmcp::transport::stdio()).await?;
+    server.bridges.set_peer(service.peer().clone());
+    tokio::spawn(server.clone().probe_loop());
     service.waiting().await?;
     Ok(())
 }
@@ -117,24 +136,40 @@ async fn doctor() -> Result<()> {
     if cat.projects.is_empty() {
         println!("  Ningún proyecto encontrado (POWEROP_PROJECTS_DIR para indicar la carpeta User).");
     }
+    for m in &cat.masters {
+        println!("  Registro de proyectos: {}", m.join("MASTER.DBF").display());
+    }
     for p in &cat.projects {
         let run = p.running || running.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(&p.name));
         println!("  {}{}  {}", p.name, if run { " [RUN]" } else { "" }, p.path.display());
     }
+    if !cat.unregistered.is_empty() {
+        println!("  Carpetas con forma de proyecto NO registradas en MASTER.DBF (ignoradas):");
+        for d in &cat.unregistered {
+            println!("     {}", d.display());
+        }
+    }
 
-    println!("\n-- Servidores y direcciones configurados en los proyectos (tablas con campo *PORT* o de red) --");
-    print_server_tables(&cat.projects);
+    let base = running.as_deref().or(cfg.default_project.as_deref()).and_then(|n| cat.resolve(n).ok());
+    let scope = base.as_ref().map(|p| cat.with_includes(p).0).unwrap_or_default();
+    match &base {
+        Some(p) => println!("\n-- Servidores configurados: {} y sus incluidos --", p.name),
+        None => println!("\n-- Servidores configurados: todos los proyectos (no hay proyecto en runtime ni POWEROP_PROJECT) --"),
+    }
+    print_servers(if base.is_some() { &scope } else { &cat.projects });
 
     println!("\n-- Puertos TCP en escucha (sin procesos del sistema) --");
     print_listening_ports();
 
-    println!("\n-- ODBC (alarm_sql) --");
+    println!("\n-- ODBC (po_alarm_sql) --");
+    let ep = alarmdb::endpoint(&cfg, &scope);
+    println!("Servidor de alarmas: {ep}");
     match alarmdb::drivers() {
         Ok(d) => {
             let has = d.iter().any(|x| x.eq_ignore_ascii_case(alarmdb::DRIVER));
             println!("Driver '{}': {}", alarmdb::DRIVER, if has { "instalado" } else { "NO instalado" });
             if has {
-                match alarmdb::query(&cfg, "select AlarmSource, AlarmState from CiAlarmObject", 3) {
+                match alarmdb::query(&cfg, &ep, "select AlarmSource, AlarmState from CiAlarmObject", 3) {
                     Ok(r) => println!("Consulta de prueba OK ({} filas de muestra)", r.rows.len()),
                     Err(e) => println!("Consulta de prueba ERROR: {e:#}"),
                 }
@@ -142,46 +177,130 @@ async fn doctor() -> Result<()> {
         }
         Err(e) => println!("ERROR listando drivers: {e:#}"),
     }
+
+    println!("\n-- Graphics Builder (gb_*) --");
+    match gb::ctdraw_exe() {
+        Some(exe) => println!("Ejecutable: {}", exe.display()),
+        None => println!("No se encontró CtDraw32.exe en la instalación (po_gb_status con launch=true no podrá abrirlo)"),
+    }
+    match gb::running_pids().as_slice() {
+        [] => println!("No está abierto: las herramientas po_gb_* lo abren o se conectan con po_gb_status (po_project_graphics no lo necesita)."),
+        pids => println!("Abierto (PID {})", pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")),
+    }
     println!("\nListo. Si todo da OK, registrá el exe como servidor MCP en el agente (ver README).");
     Ok(())
 }
 
-/// Tablas de configuración de servidores (alarmas, tendencias, I/O, red...): las que tienen un campo
-/// con "PORT" en el nombre o se llaman como direcciones de red. Muestra pocas filas de cada una.
-fn print_server_tables(projects: &[project::Project]) {
-    const MAX_ROWS: usize = 8;
+/// Registro de una tabla DBF de proyecto: proyecto de origen y campos (nombre en mayúsculas → valor).
+struct Row {
+    project: String,
+    fields: std::collections::HashMap<String, String>,
+}
+
+impl Row {
+    fn get(&self, field: &str) -> &str {
+        self.fields.get(field).map(String::as_str).unwrap_or("")
+    }
+}
+
+/// Registros no borrados de `table` en todos los proyectos dados.
+fn table_rows(projects: &[project::Project], table: &str) -> Vec<Row> {
+    let mut out = Vec::new();
     for p in projects {
-        for path in project::files_with_ext(&p.path, "dbf") {
-            let table = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-            let Ok(d) = dbf::Dbf::open(&path) else { continue };
-            let has_port = d.fields.iter().any(|f| f.name.to_uppercase().contains("PORT"));
-            let is_net = table.contains("net") || table.contains("addr") || table.contains("srv") || table.contains("server");
-            if !(has_port || is_net) {
-                continue;
-            }
-            let mut rows = Vec::new();
-            let mut total = 0;
-            d.for_each(|_, vals| {
-                total += 1;
-                if rows.len() < MAX_ROWS {
-                    let cells: Vec<String> = d
-                        .fields
-                        .iter()
-                        .zip(&vals)
-                        .filter(|(_, v)| !v.is_empty())
-                        .map(|(f, v)| format!("{}={}", f.name, text::truncate(v, 60)))
-                        .collect();
-                    rows.push(cells.join("  "));
+        let Some(d) = project::table_path(&p.path, table).and_then(|t| dbf::Dbf::open(&t).ok()) else { continue };
+        d.for_each(|_, vals| {
+            let fields = d.fields.iter().zip(vals).map(|(f, v)| (f.name.to_uppercase(), v)).collect();
+            out.push(Row { project: p.name.clone(), fields });
+            true
+        });
+    }
+    out
+}
+
+/// Clusters, direcciones de red y servidores (alarmas, tendencias, reportes, I/O) de los proyectos,
+/// con la dirección de red resuelta y los puertos por defecto cuando el campo está vacío.
+fn print_servers(projects: &[project::Project]) {
+    let clusters = table_rows(projects, "cluster");
+    let netaddrs = table_rows(projects, "netaddr");
+    let computers = table_rows(projects, "computer");
+    let port = |v: &str, default: Option<u16>| match (v.trim(), default) {
+        ("", Some(d)) => format!("{d} (def.)"),
+        ("", None) => "-".into(),
+        (v, _) => v.to_string(),
+    };
+
+    let list: Vec<String> = clusters.iter().map(|c| format!("{} [{}]", c.get("NAME"), c.project)).collect();
+    println!("  Clusters: {}", if list.is_empty() { "(ninguno)".into() } else { list.join(", ") });
+
+    println!("  Direcciones de red (netaddr):");
+    if netaddrs.is_empty() {
+        println!("     (ninguna)");
+    }
+    for n in &netaddrs {
+        let comp = n.get("COMPUTER");
+        let dns = computers.iter().find(|c| c.get("NAME").eq_ignore_ascii_case(comp)).map(|c| c.get("DNSNAME")).unwrap_or("");
+        let comp = match (comp, dns) {
+            ("", _) => String::new(),
+            (c, "") => format!("  equipo {c}"),
+            (c, d) => format!("  equipo {c} ({d})"),
+        };
+        println!("     {:<20} {:<16}{comp}  [{}]", n.get("NAME"), n.get("ADDRESS"), n.project);
+    }
+
+    // (tabla, rótulo, puerto por defecto, puertos extra (campo, rótulo, defecto))
+    let kinds: [(&str, &str, u16, &[(&str, &str, Option<u16>)]); 4] = [
+        ("almsrv", "Alarmas", 2080, &[("DBPORT", "BD", Some(5482)), ("PUBPORT", "pub", None)]),
+        ("trnsrv", "Tendencias", 2085, &[("PFPORT", "PF", None)]),
+        ("repsrv", "Reportes", 2084, &[("PFPORT", "PF", None)]),
+        ("scanner", "I/O", 2082, &[("PEERPORT", "peer", None)]),
+    ];
+    println!("  Servidores:");
+    let mut any = false;
+    for (table, label, default, extra) in kinds {
+        for s in table_rows(projects, table) {
+            any = true;
+            let na = s.get("NETADDR");
+            let addr = match netaddrs.iter().find(|n| n.get("NAME").eq_ignore_ascii_case(na)) {
+                _ if na.is_empty() => "(sin NETADDR)".to_string(),
+                Some(n) => format!("{na} → {}", n.get("ADDRESS")),
+                None => format!("{na} (no está en netaddr)"),
+            };
+            let mode = if s.get("MODE").is_empty() { "Primary" } else { s.get("MODE") };
+            let mut ports = format!("puerto {}", port(s.get("PORT"), Some(default)));
+            for (f, l, d) in extra {
+                if d.is_some() || !s.get(f).is_empty() {
+                    ports.push_str(&format!("  {l} {}", port(s.get(f), *d)));
                 }
-                true
-            });
-            if total == 0 {
-                continue;
             }
-            println!("  {}/{} ({} registros)", p.name, table, total);
-            for r in rows {
-                println!("     {r}");
-            }
+            println!(
+                "     {label:<10} {:<16} {mode:<8} cluster {:<8} {addr}  {ports}  [{}]",
+                s.get("NAME"),
+                if s.get("CLUSTER").is_empty() { "-" } else { s.get("CLUSTER") },
+                s.project
+            );
+        }
+    }
+    if !any {
+        println!("     (ninguno)");
+    }
+
+    const MAX_UNITS: usize = 15;
+    let units = table_rows(projects, "units");
+    if !units.is_empty() {
+        println!("  Dispositivos de I/O (units, {}):", units.len());
+        for u in units.iter().take(MAX_UNITS) {
+            let mem = if u.get("MEMORY").eq_ignore_ascii_case("TRUE") { "  memoria" } else { "" };
+            println!(
+                "     {:<20} servidor {:<14} {} {}{mem}  [{}]",
+                u.get("NAME"),
+                u.get("SERVER"),
+                u.get("PROTOCOL"),
+                text::truncate(u.get("PORT"), 30),
+                u.project
+            );
+        }
+        if units.len() > MAX_UNITS {
+            println!("     ... y {} más (po_project_query table=units)", units.len() - MAX_UNITS);
         }
     }
 }

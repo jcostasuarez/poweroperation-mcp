@@ -68,8 +68,55 @@ pub fn describe_error(code: u32) -> String {
     }
 }
 
+/// Error de CtAPI con el código de GetLastError() que lo causó. El mensaje es el de `describe_error`;
+/// el código permite reconocer un error (p. ej. 233) por valor y no solo por el texto.
+#[derive(Debug)]
+pub struct CtError {
+    pub code: u32,
+    msg: String,
+}
+
+impl std::fmt::Display for CtError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for CtError {}
+
+fn ct_error(code: u32, msg: String) -> anyhow::Error {
+    anyhow::Error::new(CtError { code, msg })
+}
+
 fn fail(op: &str) -> anyhow::Error {
-    anyhow!("{op} falló: {}", describe_error(last_error()))
+    let code = last_error();
+    ct_error(code, format!("{op} falló: {}", describe_error(code)))
+}
+
+/// Código Citect 233: el proceso cliente del runtime no está (o se está reiniciando). Transitorio.
+const CITECT_CLIENT_DOWN: u32 = 233;
+/// Windows 233 (ERROR_PIPE_NOT_CONNECTED): reference.md lo informa para el mismo síntoma.
+const WIN_PIPE_NOT_CONNECTED: u32 = 233;
+/// Pausa antes de reconectar tras un 233 (el cliente tarda un momento en volver).
+const RESTART_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Código de error que indica que el cliente del runtime se está reiniciando.
+fn is_restart_code(code: u32) -> bool {
+    code == ERROR_USER_DEFINED_BASE + CITECT_CLIENT_DOWN || code == WIN_PIPE_NOT_CONNECTED
+}
+
+/// `true` si el error de CtAPI es de los transitorios de reinicio del cliente (ver `is_restart_code`).
+pub fn is_restarting_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<CtError>().is_some_and(|c| is_restart_code(c.code))
+}
+
+/// Agrega al error la indicación de reintentar, si era un 233.
+fn restart_hint(e: anyhow::Error) -> anyhow::Error {
+    if is_restarting_error(&e) {
+        anyhow!("{e:#} (el cliente se está reiniciando; probá de nuevo en unos segundos)")
+    } else {
+        e
+    }
 }
 
 /// DLL candidato encontrado en disco.
@@ -225,18 +272,18 @@ impl Session<'_> {
         Ok(decode_cstr(&buf))
     }
 
-    /// Proyecto que corre en el runtime: ProjectCurrentGet() y, si no responde, el `[CtEdit] Run`
-    /// que usa el proceso (ParameterGet), reducido al nombre de la carpeta.
+    /// Proyecto que corre en el runtime: ProjectInfo(0) (nombre del proyecto compilado; en PO 2024
+    /// ProjectCurrentGet() da error Citect 292), ProjectCurrentGet() en versiones anteriores y, si no,
+    /// el `[CtEdit] Run` del proceso (ParameterGet), reducido al nombre de la carpeta.
     pub fn running_project(&self) -> Option<String> {
         let clean = |s: String| {
             let s = s.trim().trim_end_matches(['\\', '/']).to_string();
             let name = s.rsplit(['\\', '/']).next().unwrap_or("").trim().to_string();
             (!name.is_empty()).then_some(name)
         };
-        self.cicode("ProjectCurrentGet()", 0)
-            .ok()
-            .and_then(clean)
-            .or_else(|| self.cicode(r#"ParameterGet("CtEdit", "Run", "")"#, 0).ok().and_then(clean))
+        ["ProjectInfo(0)", "ProjectCurrentGet()", r#"ParameterGet("CtEdit", "Run", "")"#]
+            .iter()
+            .find_map(|cmd| self.cicode(cmd, 0).ok().and_then(clean))
     }
 
     fn get_property(&self, obj: Handle, name: &str) -> Option<String> {
@@ -321,12 +368,15 @@ impl State {
             let h = unsafe { (lib.open)(p(&host), p(&user), p(&pass), CT_OPEN_RECONNECT) };
             if h.is_null() {
                 let code = last_error();
-                bail!(
-                    "ctOpen falló: {}. ¿Está corriendo el runtime de Power Operation{}? \
-                     Para conexión remota hace falta [CtAPI] Remote=1 en el citect.ini del servidor y POWEROP_USER/POWEROP_PASSWORD.",
-                    describe_error(code),
-                    cfg.host.as_deref().map(|h| format!(" en {h}")).unwrap_or_else(|| " en este equipo".into())
-                );
+                return Err(ct_error(
+                    code,
+                    format!(
+                        "ctOpen falló: {}. ¿Está corriendo el runtime de Power Operation{}? \
+                         Para conexión remota hace falta [CtAPI] Remote=1 en el citect.ini del servidor y POWEROP_USER/POWEROP_PASSWORD.",
+                        describe_error(code),
+                        cfg.host.as_deref().map(|h| format!(" en {h}")).unwrap_or_else(|| " en este equipo".into())
+                    ),
+                ));
             }
             self.handle = h as usize;
         }
@@ -352,18 +402,17 @@ impl CtApi {
         Self { cfg, state: Arc::new(Mutex::new(State { lib: None, handle: 0 })) }
     }
 
-    /// Ejecuta `f` con una sesión abierta (carga el DLL y conecta si hace falta).
-    pub async fn call<T, F>(&self, f: F) -> Result<T>
+    /// Ejecuta `job` en un hilo bloqueante, con el mutex de CtAPI tomado y tiempo máximo.
+    async fn run<T, F>(&self, job: F) -> Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Session) -> Result<T> + Send + 'static,
+        F: FnOnce(&mut State, &Config) -> Result<T> + Send + 'static,
     {
         let state = self.state.clone();
         let cfg = self.cfg.clone();
         let task = tokio::task::spawn_blocking(move || {
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-            let (lib, h) = st.ensure(&cfg)?;
-            f(&Session { lib: &lib, h })
+            job(&mut *st, cfg.as_ref())
         });
         match tokio::time::timeout(self.cfg.timeout, task).await {
             Ok(Ok(r)) => r,
@@ -375,6 +424,43 @@ impl CtApi {
         }
     }
 
+    /// Ejecuta `f` con una sesión abierta (carga el DLL y conecta si hace falta).
+    pub async fn call<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Session) -> Result<T> + Send + 'static,
+    {
+        self.run(move |st, cfg| {
+            let (lib, h) = st.ensure(cfg)?;
+            f(&Session { lib: &lib, h })
+        })
+        .await
+    }
+
+    /// Como `call`, pero si falla con 233 (el cliente del runtime se está reiniciando) cierra la conexión,
+    /// espera un momento, reconecta y reintenta UNA vez. Si vuelve a fallar, el error indica que se reintente.
+    /// `f` puede ejecutarse dos veces: usarla solo para lecturas (o para escrituras que no cambian nada si se repiten).
+    pub async fn call_retry<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Fn(&Session) -> Result<T> + Send + Sync + 'static,
+    {
+        let f = Arc::new(f);
+        let this = self;
+        with_restart_retry(this, RESTART_PAUSE, move || {
+            let f = f.clone();
+            this.call(move |s| (*f)(s))
+        })
+        .await
+    }
+
+    /// Solo abre la conexión (ctOpen), con el mismo reintento ante 233 que `call_retry`. No ejecuta nada en el
+    /// runtime: sirve antes de una escritura, que nunca se reintenta.
+    pub async fn connect_retry(&self) -> Result<()> {
+        let this = self;
+        with_restart_retry(this, RESTART_PAUSE, move || this.run(|st, cfg| st.ensure(cfg).map(|_| ()))).await
+    }
+
     /// Cierra la conexión actual (la próxima llamada vuelve a conectar).
     pub async fn disconnect(&self) {
         let state = self.state.clone();
@@ -384,5 +470,89 @@ impl CtApi {
     /// DLL cargado, si lo hay.
     pub fn loaded_dll(&self) -> Option<PathBuf> {
         self.state.try_lock().ok().and_then(|s| s.lib.as_ref().map(|l| l.path.clone()))
+    }
+}
+
+/// Ejecuta `attempt`; si falla con 233 cierra la conexión, espera `pause` y lo intenta una vez más.
+async fn with_restart_retry<T, Fut, G>(api: &CtApi, pause: std::time::Duration, mut attempt: G) -> Result<T>
+where
+    Fut: std::future::Future<Output = Result<T>>,
+    G: FnMut() -> Fut,
+{
+    match attempt().await {
+        Err(e) if is_restarting_error(&e) => {
+            api.disconnect().await;
+            tokio::time::sleep(pause).await;
+            attempt().await.map_err(restart_hint)
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api() -> CtApi {
+        CtApi::new(Arc::new(crate::testutil::config(&std::env::temp_dir())))
+    }
+
+    #[test]
+    fn detecta_233_por_valor() {
+        // Citect 233 tal como lo arma `fail`/`ct_error`.
+        let citect = ct_error(ERROR_USER_DEFINED_BASE + 233, format!("ctTagRead('X') falló: {}", describe_error(ERROR_USER_DEFINED_BASE + 233)));
+        assert!(is_restarting_error(&citect));
+        assert!(citect.to_string().contains("error Citect 233"));
+        // Windows 233 (pipe no conectado): mismo síntoma según reference.md.
+        assert!(is_restarting_error(&ct_error(233, "x".into())));
+        // Otros códigos Citect (424 = tag inexistente, 292, 274) no son transitorios.
+        assert!(!is_restarting_error(&ct_error(ERROR_USER_DEFINED_BASE + 424, "x".into())));
+        assert!(!is_restarting_error(&ct_error(ERROR_USER_DEFINED_BASE + 274, "x".into())));
+        // El texto solo no cuenta: sin código no se reintenta.
+        assert!(!is_restarting_error(&anyhow!("error Citect 233")));
+    }
+
+    #[test]
+    fn mensaje_de_reinicio() {
+        let e = restart_hint(ct_error(ERROR_USER_DEFINED_BASE + 233, "ctOpen falló".into()));
+        assert!(format!("{e:#}").ends_with("(el cliente se está reiniciando; probá de nuevo en unos segundos)"));
+        let otro = restart_hint(ct_error(ERROR_USER_DEFINED_BASE + 424, "ctTagRead falló".into()));
+        assert_eq!(format!("{otro:#}"), "ctTagRead falló");
+    }
+
+    #[tokio::test]
+    async fn reintenta_una_vez_tras_233() {
+        let api = api();
+        let mut intentos = 0;
+        let r: Result<u32> = with_restart_retry(&api, std::time::Duration::ZERO, || {
+            intentos += 1;
+            let n = intentos;
+            async move { if n == 1 { Err(ct_error(ERROR_USER_DEFINED_BASE + 233, "x".into())) } else { Ok(n) } }
+        })
+        .await;
+        assert_eq!(r.unwrap(), 2);
+        assert_eq!(intentos, 2);
+    }
+
+    #[tokio::test]
+    async fn no_reintenta_otros_errores_y_avisa_si_233_persiste() {
+        let api = api();
+        let mut intentos = 0;
+        let r: Result<u32> = with_restart_retry(&api, std::time::Duration::ZERO, || {
+            intentos += 1;
+            async { Err(ct_error(ERROR_USER_DEFINED_BASE + 424, "tag no existe".into())) }
+        })
+        .await;
+        assert_eq!(intentos, 1);
+        assert_eq!(format!("{:#}", r.unwrap_err()), "tag no existe");
+
+        let mut intentos = 0;
+        let r: Result<u32> = with_restart_retry(&api, std::time::Duration::ZERO, || {
+            intentos += 1;
+            async { Err(ct_error(ERROR_USER_DEFINED_BASE + 233, "ctOpen falló".into())) }
+        })
+        .await;
+        assert_eq!(intentos, 2, "debe reintentar una sola vez");
+        assert!(format!("{:#}", r.unwrap_err()).contains("el cliente se está reiniciando"));
     }
 }
