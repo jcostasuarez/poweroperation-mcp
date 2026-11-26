@@ -33,6 +33,26 @@ pub struct Config {
     pub modbus: Vec<ModbusTarget>,
     /// Segundos entre sondeos de los puentes CTAPI, ODBC y MODBUS (0 = solo al arrancar y con po_status).
     pub probe_secs: u64,
+    /// Páginas de proyectos protegidos (librerías de PO como PLS_Include) que po_gb_page_edit puede modificar
+    /// (`POWEROP_GB_ALLOW_PAGES=Proyecto/Página;...`). Vacío = ninguna.
+    pub gb_allow_pages: Vec<(String, String)>,
+}
+
+/// Lee `POWEROP_GB_ALLOW_PAGES`: entradas `Proyecto/Página` (o `Proyecto\Página`) separadas por `;`.
+/// Solo páginas exactas: sin comodines, para que habilitar una página no abra toda la librería.
+pub fn parse_page_list(v: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for item in v.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((proj, page)) = item.split_once(['/', '\\']) else {
+            return Err(format!("'{item}': falta el proyecto (usá Proyecto/Página)"));
+        };
+        let (proj, page) = (proj.trim(), page.trim());
+        if proj.is_empty() || page.is_empty() || page.contains(['/', '\\', '*', '?']) {
+            return Err(format!("'{item}': tiene que ser Proyecto/Página con una página exacta (sin comodines)"));
+        }
+        out.push((proj.to_string(), page.to_string()));
+    }
+    Ok(out)
 }
 
 /// Un PLC Modbus TCP de `POWEROP_MODBUS` (`nombre=host:puerto/unidad`; nombre, puerto y unidad opcionales).
@@ -128,6 +148,14 @@ impl Config {
                 })
                 .unwrap_or_default(),
             probe_secs: var("POWEROP_PROBE_SECS").and_then(|v| v.parse().ok()).unwrap_or(30),
+            gb_allow_pages: var("POWEROP_GB_ALLOW_PAGES")
+                .map(|v| {
+                    parse_page_list(&v).unwrap_or_else(|e| {
+                        tracing::warn!("POWEROP_GB_ALLOW_PAGES ignorado: {e}");
+                        vec![]
+                    })
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -138,7 +166,7 @@ impl Config {
             "POWEROP_CTAPI={}\nPOWEROP_HOST={}\nPOWEROP_USER={}\nPOWEROP_PASSWORD={}\nPOWEROP_CLUSTER={}\n\
              POWEROP_PROJECTS_DIR={}\nPOWEROP_PROJECT={}\nPOWEROP_ALLOW_WRITE={}\nPOWEROP_TIMEOUT_SECS={}\n\
              POWEROP_ALARM_HOST={}\nPOWEROP_ALARM_PORT={}\nPOWEROP_ALARM_SYSTEMS_XML={}\nPOWEROP_AUDIT_LOG={}\n\
-             POWEROP_MODBUS={}\nPOWEROP_PROBE_SECS={}",
+             POWEROP_MODBUS={}\nPOWEROP_PROBE_SECS={}\nPOWEROP_GB_ALLOW_PAGES={}",
             self.ctapi_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(auto)".into()),
             self.host.clone().unwrap_or_else(|| "(local)".into()),
             opt(&self.user),
@@ -162,6 +190,11 @@ impl Config {
                 self.modbus.iter().map(ToString::to_string).collect::<Vec<_>>().join(";")
             },
             self.probe_secs,
+            if self.gb_allow_pages.is_empty() {
+                "(no)".into()
+            } else {
+                self.gb_allow_pages.iter().map(|(p, g)| format!("{p}/{g}")).collect::<Vec<_>>().join(";")
+            },
         )
     }
 }
@@ -179,5 +212,16 @@ mod tests {
         assert_eq!(t[1].name, "PLC2");
         assert!(parse_modbus("A=x:99999").is_err());
         assert!(parse_modbus("A=x;A=y").is_err());
+    }
+
+    #[test]
+    fn page_list() {
+        let t = parse_page_list(" PLS_Include/!equipment1 ; Lib\\Pag2;").unwrap();
+        assert_eq!(t, vec![("PLS_Include".into(), "!equipment1".into()), ("Lib".into(), "Pag2".into())]);
+        assert!(parse_page_list("sin_proyecto").is_err());
+        assert!(parse_page_list("PLS_Include/*").is_err());
+        assert!(parse_page_list("PLS_Include/").is_err());
+        assert!(parse_page_list("A/b/c").is_err());
+        assert!(parse_page_list("").unwrap().is_empty());
     }
 }

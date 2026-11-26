@@ -50,5 +50,6 @@ pub fn config(audit_dir: &Path) -> Config {
         audit_log: audit_dir.join("audit.log"),
         modbus: vec![],
         probe_secs: 0,
+        gb_allow_pages: vec![],
     }
 }

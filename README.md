@@ -90,6 +90,7 @@ Ver [.env.example](.env.example). Lo principal:
 | `POWEROP_PROJECTS_DIR`, `POWEROP_PROJECT` | Dónde están los proyectos y cuál usar por defecto. |
 | `POWEROP_ALARM_HOST`, `POWEROP_ALARM_PORT` | Servidor de alarmas para `po_alarm_sql`. Vacíos = el del proyecto (tablas `almsrv`/`netaddr`) o `localhost:5482`. |
 | `POWEROP_ALLOW_WRITE` | `1` habilita escrituras. |
+| `POWEROP_GB_ALLOW_PAGES` | Páginas exactas de librerías de PO (`PLS_Include/!equipment1;...`) que `po_gb_page_edit` puede modificar. Vacío = ninguna. |
 
 ## Cómo funciona
 
@@ -154,4 +155,15 @@ Requiere la toolchain MSVC (Visual Studio Build Tools con C++). El CRT se enlaza
 el exe no necesita el redistribuible de Visual C++. `tests\runtime.rs` compila y usa un `CtApi.dll` falso
 (`tests/fakectapi`) que imita el comportamiento verificado de PO 2024; `tests\live.rs` verifica las herramientas contra el runtime y el
 Graphics Builder reales (`gb_write` crea y edita la página `MCP_GB_Test` de MCP_Demo). El entorno de pruebas está
-descrito en `AGENT.md`.
+descrito en `AGENT.md` (local, no se publica).
+
+### Release
+
+```powershell
+.\scripts\release.ps1                  # cargo test + build x64 y x86 + dist\poweroperation-mcp-<versión>.zip (+ .sha256)
+.\scripts\release.ps1 -Publish         # además crea el tag v<versión> y el release en GitHub (requiere gh)
+.\scripts\release.ps1 -Publish -Draft  # el release queda como borrador
+```
+La versión sale de `Cargo.toml`. Con `-Publish` exige el árbol limpio y la rama ya subida, y no pisa un release
+existente. Si Rust no encuentra el linker de Visual Studio (VS sin registrar en vswhere), el script carga el
+entorno desde `vcvarsall.bat` por su cuenta.

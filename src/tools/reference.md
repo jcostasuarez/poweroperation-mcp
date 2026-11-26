@@ -409,6 +409,14 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   - `expression` en `text` o `set_dynamic`: texto mostrado = expresión Cicode, p. ej. `"\"Secuencia: \" + TRF_Seq"`
     (`PropertiesDisplayValuePut`, tipo String).
   - `button`: x, y, x2, y2, `text`, `command` (Cicode al presionar), `up_command` (al soltar), `privilege` (1 a 255).
+  - `set_touch` (solo en `po_gb_page_edit`/`po_gb_genie_edit`): `{an, action: "down"|"up", command, log_message?,
+    repeat_ms?}` cambia el comando de Input | Touch de un objeto ya colocado. Lee antes lo actual
+    (`PropertiesInputTouchGet`) y conserva el mensaje de log y la repetición si no se indican; la respuesta trae
+    `before` y `after`. Si no puede leer, no escribe. **Sin verificar en Graphics Builder**: la firma de
+    `PropertiesInputTouchGet` (acción de entrada + comando, log y repetición de salida) y que la acción 0/1 sea la
+    misma que en el Put (que sí está verificado con `button`). El typelib lista `PropertiesInputTouchGetW`/`PutW`; el
+    MCP llama por nombre sin W (IDispatch), como el Put de `button`, que funciona. Verificar con `po_project_query`
+    sobre `pgtouch`/`pgbutton` después de guardar.
   - `trend`: x, y, x2, y2, `pens` (1 a 8: `{expression: "<trend tag>", colour, off_colour?}`), `samples`,
     `pixels_per_sample` (1 a 32; por defecto 2 px y tantas muestras como entren en el ancho). Usa `DrawTrend` +
     `PropertiesTrendPutEx` (documentados en la ayuda de la automatización). Cada pluma se escala con ENG_ZERO/ENG_FULL
@@ -455,6 +463,11 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   `Transferencia_Ejemplo/Transferencia` como `PLS_Include`). No usarlo para saber dónde está la página.
 - Escrituras (`po_gb_page_create`, `po_gb_page_edit`, `po_gb_page_delete`): `POWEROP_ALLOW_WRITE=1`, auditadas, y nunca en
   proyectos de sistema/librerías (System, Include, Library_*, PLS_Include, PSO_Equipment, IndustrialGraphics_Include).
+  Excepción: `po_gb_page_edit` sobre una página exacta listada en `POWEROP_GB_ALLOW_PAGES` (p. ej.
+  `PLS_Include/!equipment1`; la respuesta trae `allowed_by`). Esas librerías las usan todos los proyectos del equipo:
+  confirmá con el usuario. Crear o borrar páginas y editar genies de librerías sigue bloqueado. **Sin verificar**: con
+  la página ya abierta, Graphics Builder puede informarla bajo otro proyecto (p. ej. `Include`, ver el error
+  conocido de `open_pages`); si `PageSelect` no la encuentra, el MCP intenta `PageOpen`.
   Antes de guardar encima o borrar, el `.ctg` se copia a `<proyecto>\_mcp_backup\` (campo `backup` de la respuesta):
   para restaurar, copiar ese archivo de vuelta como `<página>.ctg`.
 

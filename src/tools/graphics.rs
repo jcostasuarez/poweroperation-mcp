@@ -35,6 +35,23 @@ fn check_writable(project: &str) -> Result<()> {
     Ok(())
 }
 
+/// Como `check_writable`, pero deja editar una página de un proyecto protegido si figura en
+/// `POWEROP_GB_ALLOW_PAGES` (página exacta). Solo la usa po_gb_page_edit: crear o borrar páginas y editar
+/// genies de librerías sigue bloqueado.
+fn check_page_writable(project: &str, page: &str, allowed: &[(String, String)]) -> Result<bool> {
+    if !PROTECTED.iter().any(|p| p.eq_ignore_ascii_case(project)) {
+        return Ok(false);
+    }
+    if allowed.iter().any(|(p, g)| p.eq_ignore_ascii_case(project) && g.eq_ignore_ascii_case(page)) {
+        return Ok(true);
+    }
+    bail!(
+        "{project} es un proyecto de sistema o librería de Power Operation: el MCP no modifica sus páginas. \
+         Para editar solo esta página, agregá {project}/{page} a POWEROP_GB_ALLOW_PAGES (afecta a todos los \
+         proyectos que incluyen {project}) y reiniciá el MCP."
+    );
+}
+
 fn s(v: &str) -> Arg {
     Arg::Str(v.to_string())
 }
@@ -393,6 +410,19 @@ pub enum PageOp {
         #[serde(default)]
         expression: Option<String>,
     },
+    /// Cambia el comando Touch (Input | Touch) de un objeto ya colocado (por AN): lee lo actual y cambia solo el
+    /// comando; el mensaje de log y la repetición se conservan salvo que se indiquen.
+    SetTouch {
+        an: i16,
+        /// `down` (al presionar) o `up` (al soltar).
+        action: String,
+        command: String,
+        #[serde(default)]
+        log_message: Option<String>,
+        /// Repetición en ms (por defecto la actual).
+        #[serde(default)]
+        repeat_ms: Option<i16>,
+    },
     /// Mueve un objeto (por AN).
     Move { an: i16, x: i16, y: i16 },
     /// Borra un objeto (por AN).
@@ -412,6 +442,7 @@ impl PageOp {
             PageOp::Symbol { .. } => "symbol",
             PageOp::SetGenieProperties { .. } => "set_genie_properties",
             PageOp::SetDynamic { .. } => "set_dynamic",
+            PageOp::SetTouch { .. } => "set_touch",
             PageOp::Move { .. } => "move",
             PageOp::Delete { .. } => "delete",
         }
@@ -578,6 +609,16 @@ fn check_op(op: &PageOp) -> Result<()> {
             (None, visible_when.as_deref(), None)
         }
         PageOp::SetDynamic { fill, visible_when, expression, .. } => (fill.as_ref(), visible_when.as_deref(), expression.as_deref()),
+        PageOp::SetTouch { action, command, repeat_ms, .. } => {
+            touch_action(action)?;
+            nonempty("command", command)?;
+            if let Some(r) = repeat_ms {
+                if *r < 1 {
+                    bail!("repeat_ms = {r}: tiene que ser 1 o más (ms)");
+                }
+            }
+            (None, None, None)
+        }
         PageOp::SetGenieProperties { .. } | PageOp::Move { .. } | PageOp::Delete { .. } => (None, None, None),
     };
     if let Some(v) = visible {
@@ -648,6 +689,16 @@ fn trend_put_args(pens: &[TrendPen], samples: i16, pixels: i16) -> Result<Vec<Ar
 }
 
 /// Valida todas las operaciones; el mensaje indica cuál falla.
+/// Acción de Input | Touch para PropertiesInputTouchGet/Put: 1 = Down (al presionar), 0 = Up (al soltar),
+/// los mismos valores que usa la op `button` (verificado en pgbutton DOWN_CMD).
+fn touch_action(a: &str) -> Result<i16> {
+    match a {
+        "down" => Ok(1),
+        "up" => Ok(0),
+        other => bail!("action '{other}' no soportada: usá down (al presionar) o up (al soltar)"),
+    }
+}
+
 fn validate_ops(ops: &[PageOp]) -> Result<()> {
     for (i, op) in ops.iter().enumerate() {
         check_op(op).map_err(|e| anyhow!("Operación {i} ({}): {e:#}", op.name()))?;
@@ -907,6 +958,26 @@ fn apply_ops(gb: &mut Session, ops: &[PageOp], libs: &[Project]) -> Result<Vec<V
                     }
                     let set = apply_dynamic(gb, fill.as_ref(), visible_when.as_deref(), expression.as_deref())?;
                     json!({"an": an, "applied": set})
+                }
+                PageOp::SetTouch { an, action, command, log_message, repeat_ms } => {
+                    gb.m("PageSelectObject", &[Arg::I2(*an)])?;
+                    let a = touch_action(action)?;
+                    // Se lee lo actual para no pisar el mensaje de log ni la repetición: si no se puede leer, no se escribe.
+                    let cur = gb
+                        .m("PropertiesInputTouchGet", &[Arg::I2(a), Arg::OutStr, Arg::OutStr, Arg::OutI2])
+                        .map_err(|e| anyhow!("{e:#} (no se pudo leer el touch actual del AN {an}; no se cambió nada)"))?;
+                    let (old_cmd, old_log) = (cur.outs[0].text(), cur.outs[1].text());
+                    let old_rep = cur.outs[2].int().unwrap_or(1) as i16;
+                    let log = log_message.clone().unwrap_or_else(|| old_log.clone());
+                    // Repetición mínima 1 ms (como en `button`): un 0 leído se escribe como 1.
+                    let rep = repeat_ms.unwrap_or(old_rep).max(1);
+                    gb.m("PropertiesInputTouchPut", &[Arg::I2(a), s(command), s(&log), Arg::I2(rep)])?;
+                    json!({
+                        "an": an,
+                        "action": action,
+                        "before": {"command": old_cmd, "log_message": old_log, "repeat_ms": old_rep},
+                        "after": {"command": command, "log_message": log, "repeat_ms": rep},
+                    })
                 }
                 PageOp::Move { an, x, y } => {
                     gb.m("PageSelectObject", &[Arg::I2(*an)])?;
@@ -1656,7 +1727,7 @@ impl PowerOpServer {
         }
     }
 
-    #[tool(name = "po_gb_page_edit", description = "Edita una página gráfica existente con Graphics Builder: lista de operaciones en orden (text con expression, rectangle/ellipse con fill, line, `look` (colores fijos, degradé, contorno, esquinas, fuente), `level` en rectangle, button con command/up_command/privilege, trend (plumas = trend tags), genie/symbol, set_genie_properties, set_dynamic (fill, visible_when, expression por AN), move/delete por AN de po_gb_page_read) y guarda (copia previa del .ctg en _mcp_backup). Confirmá con el usuario. Requiere POWEROP_ALLOW_WRITE=1.")]
+    #[tool(name = "po_gb_page_edit", description = "Edita una página gráfica existente con Graphics Builder: lista de operaciones en orden (text con expression, rectangle/ellipse con fill, line, `look` (colores fijos, degradé, contorno, esquinas, fuente), `level` en rectangle, button con command/up_command/privilege, trend (plumas = trend tags), genie/symbol, set_genie_properties, set_dynamic (fill, visible_when, expression por AN), set_touch (comando Touch por AN, conserva log y repetición), move/delete por AN de po_gb_page_read) y guarda (copia previa del .ctg en _mcp_backup). Páginas de librerías de PO solo si están en POWEROP_GB_ALLOW_PAGES. Confirmá con el usuario. Requiere POWEROP_ALLOW_WRITE=1.")]
     async fn gb_page_edit(&self, Parameters(p): Parameters<GbPageEditParams>) -> ToolResult {
         self.require_write("gb_page_edit").map_err(err)?;
         if p.ops.is_empty() {
@@ -1664,7 +1735,7 @@ impl PowerOpServer {
         }
         validate_ops(&p.ops).map_err(err)?;
         let proj = self.project(p.project.as_deref()).await.map_err(err)?;
-        check_writable(&proj.name).map_err(err)?;
+        let protected_page = check_page_writable(&proj.name, &p.page, &self.cfg.gb_allow_pages).map_err(err)?;
         let hint = global_ctl_hint(&proj);
         let cat = self.catalog(false).await.map_err(err)?;
         let (libs, _) = cat.with_includes(&proj);
@@ -1675,7 +1746,12 @@ impl PowerOpServer {
             Some(f) if save => Some(super::project::backup(&f).map_err(|e| format!("No se pudo respaldar la página: {e:#}"))?.display().to_string()),
             _ => None,
         };
-        let detail = format!("{pname}/{} ({} operaciones, guardar={save})", p.page, p.ops.len());
+        let detail = format!(
+            "{pname}/{} ({} operaciones, guardar={save}{})",
+            p.page,
+            p.ops.len(),
+            if protected_page { ", proyecto protegido habilitado por POWEROP_GB_ALLOW_PAGES" } else { "" }
+        );
         let r = self
             .gb
             .call(move |gb| {
@@ -1692,7 +1768,11 @@ impl PowerOpServer {
                     }
                     let done = result?;
                     let saved = saved?;
-                    Ok(json!({"project": pname, "page": p.page, "saved": saved, "backup": backup, "ops": done, "left_open": !opened || !saved && save, "warnings": warnings_json(gb)}))
+                    let mut v = json!({"project": pname, "page": p.page, "saved": saved, "backup": backup, "ops": done, "left_open": !opened || !saved && save, "warnings": warnings_json(gb)});
+                    if protected_page {
+                        v["allowed_by"] = json!("POWEROP_GB_ALLOW_PAGES");
+                    }
+                    Ok(v)
                 })
             })
             .await;
@@ -2087,6 +2167,36 @@ mod tests {
         let cat = Catalog { projects: vec![libs[0].clone(), Project { name: "Include".into(), path: inc, running: false }], ..Default::default() };
         assert_eq!(visible_projects(&cat, "demo"), ["Demo", "Include"]);
         assert_eq!(visible_projects(&cat, "Otro"), ["Otro", "Include"]);
+    }
+
+    #[test]
+    fn protected_pages_need_allow_list() {
+        let allow = vec![("PLS_Include".to_string(), "!equipment1".to_string())];
+        assert_eq!(check_page_writable("MCP_Demo", "P1", &[]).unwrap(), false);
+        assert_eq!(check_page_writable("pls_include", "!Equipment1", &allow).unwrap(), true);
+        let e = check_page_writable("PLS_Include", "!equipment2", &allow).unwrap_err().to_string();
+        assert!(e.contains("POWEROP_GB_ALLOW_PAGES"), "{e}");
+        assert!(check_page_writable("Include", "!equipment1", &allow).is_err());
+        // El resto de las escrituras en librerías sigue bloqueado.
+        assert!(check_writable("PLS_Include").is_err());
+    }
+
+    #[test]
+    fn validate_set_touch() {
+        let ok = ops(json!([
+            {"op": "set_touch", "an": 43, "action": "up", "command": "IF Tag1 = 0 THEN TagWrite(\"Tag1\", 1); END"},
+            {"op": "set_touch", "an": 44, "action": "down", "command": "Cmd()", "log_message": "Mando", "repeat_ms": 500}
+        ]));
+        assert!(validate_ops(&ok).is_ok(), "{:?}", validate_ops(&ok));
+        for (bad, campo) in [
+            (json!({"op": "set_touch", "an": 1, "action": "repeat", "command": "X()"}), "action"),
+            (json!({"op": "set_touch", "an": 1, "action": "up", "command": " "}), "command"),
+            (json!({"op": "set_touch", "an": 1, "action": "up", "command": "X()", "repeat_ms": 0}), "repeat_ms"),
+        ] {
+            let e = validate_ops(&ops(json!([bad]))).unwrap_err().to_string();
+            assert!(e.contains(campo) && e.contains("set_touch"), "{e}");
+        }
+        assert!(serde_json::from_value::<PageOp>(json!({"op": "set_touch", "an": 1, "action": "up", "command": "X()", "repeat": 5})).is_err());
     }
 
     #[test]
