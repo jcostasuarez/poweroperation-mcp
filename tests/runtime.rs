@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use common::{Checks, Mcp, fake_projects, json_of, temp_dir};
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// Compila `tests/fakectapi` y devuelve la carpeta con su `CtApi.dll`.
 fn build_fake_ctapi() -> PathBuf {
@@ -82,6 +82,35 @@ fn runtime_tools_with_fake_ctapi() {
     c.check("tag_read valor", j[0]["value"] == "1234.5", &t);
     let e1 = j[1]["error"].as_str().unwrap_or("");
     c.check("tag_read error Citect decodificado (424 = tag no encontrado)", e1.contains("error Citect 424") && e1.contains("0x100001A8"), &t);
+    c.check("tag_read error Citect con su título de la ayuda", e1.contains("\"Tag not found\""), &t);
+    c.check("tag_read con calidad", j[0]["quality"] == "GOOD" && j[0].get("quality_detail").is_none(), &t);
+    // ctTagReadEx no falla con un tag inexistente (da INVALID_TAG): el MCP muestra el error de ctTagRead.
+    let (_, t) = mcp.call("po_tag_read", json!({"tags": ["NoExiste"]}));
+    let e = json_of(&t)[0]["error"].as_str().unwrap_or("").to_string();
+    c.check("tag_read de un tag inexistente solo = error 424", e.contains("error Citect 424") && e.contains("\"Tag not found\""), &t);
+    // El falso da 10:00:05Z por lista y 10:00:00Z por ctTagReadEx: varios tags van en un pedido (lista) y el
+    // que la lista no devuelve se relee por ctTagReadEx para tener el error real.
+    let ts = |v: &Value| v["timestamp"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.timestamp());
+    c.check("varios tags: lectura por lista (hora de la lista)", ts(&j[0]) == Some(1_795_773_605), &t);
+
+    let (_, t) = mcp.call("po_tag_read", json!({"tags": ["Feeder2\\MMXU1\\TotW"]}));
+    let j = json_of(&t);
+    c.check(
+        "un tag: ctTagReadEx con calidad mala y detalle",
+        j[0]["quality"] == "BAD/COMM_FAILURE" && j[0]["quality_detail"]["extended"] == "COMM_DEV_BAD" && ts(&j[0]) == Some(1_795_773_600),
+        &t,
+    );
+
+    let (_, t) = mcp.call("po_tag_read", json!({"tags": ["Feeder1\\MMXU1\\TotW"], "details": true}));
+    let j = json_of(&t);
+    c.check(
+        "details: unidades, descripción, rango y tipo (ctTagGetProperty)",
+        j[0]["units"] == "kW" && j[0]["description"] == "Potencia total" && j[0]["eng_high"] == "1000" && j[0]["type"] == "REAL",
+        &t,
+    );
+
+    let (_, t) = mcp.call("po_tag_read", json!({"tags": ["Feeder1\\MMXU1\\TotW", "Feeder2\\MMXU1\\TotW"], "samples": 2, "interval_secs": 0.2}));
+    c.check("samples marca la calidad mala en el valor", t.contains("0 [BAD/COMM_FAILURE]"), &t);
 
     let (_, t) = mcp.call("po_tag_write", json!({"tag": "Feeder1\\XCBR1\\Pos", "value": "0"}));
     let j = json_of(&t);

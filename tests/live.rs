@@ -36,6 +36,20 @@ fn verify_mcp_demo() {
     c.check("tag_read REAL", j[0]["value"].as_str().is_some_and(|v| v.trim().parse::<f64>().is_ok()), &t);
     c.check("tag_read INT", j[1]["value"] == "1" || j[1]["value"] == "2", &t);
     c.check("tag inexistente = error Citect 424", j[2]["error"].as_str().is_some_and(|e| e.contains("error Citect 424")), &t);
+    c.check("error Citect con título (\"Tag not found\")", j[2]["error"].as_str().is_some_and(|e| e.contains("Tag not found")), &t);
+    // Calidad y hora (lista con varios tags): hora de hoy, a menos de 10 min del reloj del equipo.
+    let recent = |v: &Value| {
+        v["timestamp"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .is_some_and(|d| (chrono::Utc::now().timestamp() - d.timestamp()).abs() < 600)
+    };
+    c.check("tag_read por lista: GOOD y hora reciente", j[0]["quality"] == "GOOD" && recent(&j[0]) && j[1]["quality"] == "GOOD", &t);
+    let (_, t) = mcp.call("po_tag_read", json!({"tags": ["Feeder1\\MMXU1\\TotW"], "details": true}));
+    show("tag_read un tag (ctTagReadEx) + details", &t);
+    let j = json_of(&t);
+    c.check("tag_read ctTagReadEx: GOOD y hora reciente", j[0]["quality"] == "GOOD" && recent(&j[0]), &t);
+    c.check("details: tipo REAL y rango", j[0]["type"] == "REAL" && j[0]["eng_high"].is_string(), &t);
 
     let (_, t) = mcp.call("po_tag_browse", json!({"filter": "TAG=Feeder1*", "with_values": true}));
     show("tag_browse", &t);

@@ -239,9 +239,28 @@ END
   `po_tag_write` acepta un tag (`tag` + `value`) o un lote (`writes: [{tag, value}]`, hasta 50): el usuario confirma
   la lista completa, cada tag se escribe y relee por separado, hay una línea de auditoría por tag y si uno falla
   se siguen los demás e informa cada resultado.
+- `po_tag_read` devuelve por tag `value`, `quality` y `timestamp` (hora local de la última actualización;
+  `value_timestamp` si el valor cambió en otro momento). Calidad (ayuda: "The Quality Item", QualityGetPart):
+  `GOOD`, `UNCERTAIN` o `BAD`, con el subestado si lo hay (`BAD/COMM_FAILURE`, `BAD/LAST_KNOWN_VALUE`,
+  `BAD/WAITING_FOR_INITIAL_DATA`, `UNCERTAIN/LAST_USABLE_VALUE`, `GOOD/LOCAL_OVERRIDE`...). `quality_detail` aparece
+  si hay algo más: `extended` (`COMM_DEV_BAD`, `COMM_IOSERVER_BAD`, `STALE`, `INVALID_TAG`, `NOT_REPLICATED`...),
+  `limit` (LOW/HIGH/CONSTANT), `override` (el valor es el forzado, no el de campo), `control_inhibit` (escribir al
+  campo está bloqueado), `datasource_error`. Un valor con calidad BAD **no es el valor real** del equipo: decirlo al
+  usuario antes de sacar conclusiones. Los tags referenciados por ítem (`Tag.V`, `Tag.Field.T`) dan siempre GOOD y
+  hora 0 (según la ayuda).
+  Varios tags se leen en **un solo pedido** (ctListNew/ctListRead: todos del mismo instante); un tag que la lista no
+  devuelve completo se relee solo (ctTagReadEx) para tener el error real. `details=true` agrega `units`,
+  `description`, `eng_low`, `eng_high` y `type` (ctTagGetProperty). Un CtApi.dll sin estas funciones da solo `value`.
+  Tag inexistente: ni ctTagReadEx ni la lista fallan (dan TRUE, valor vacío y `BAD` + `INVALID_TAG`); el MCP lo relee
+  con ctTagRead y muestra su error, `error Citect 424 "Tag not found"`, igual que antes. **(verificado** contra el
+  runtime de MCP_Demo el 2026-11-27: horas FILETIME en hora local con milisegundos, elementos numéricos de
+  ctListItem desde la primera lectura, 4 tags en una lista con un solo releído (el inexistente), `details` con
+  kW / rango 0–1000 / REAL**)**.
 - `po_tag_read` con `samples` (hasta 120) e `interval_secs`: lee los mismos tags N veces cada X s (hasta 300 s en
   total) y resume por tag los valores distintos, cantidad de cambios y la hora del primer cambio. Sirve para
-  verificar secuencias (p. ej. una transferencia) sin escribir nada.
+  verificar secuencias (p. ej. una transferencia) sin escribir nada. Cada muestra es una lectura por lista; si la
+  calidad no es GOOD el valor sale como `"0 [BAD/COMM_FAILURE]"` (perder la comunicación cuenta como cambio).
+  `po_tag_browse with_values=true` agrega `QUALITY` a cada fila.
 - Error Citect/Windows **233** justo después de un reinicio del cliente es transitorio: en lecturas el MCP cierra la
   conexión, espera 1 s y reintenta una vez; si persiste, el error dice "el cliente se está reiniciando". En
   `po_tag_write` solo se reintenta la conexión, nunca la escritura (verificá con `po_tag_read`). **(verificado con un
@@ -254,7 +273,10 @@ END
 - Cliente al arrancar: abre en la página de `[Page] Startup` del citect.ini (en PO, `PageMenu`) y puede mostrar un
   error de `PLS_StartAdvOneLine()` (causa no verificada). `[Client] AutoLoginMode` intenta entrar con el usuario de
   Windows y da "invalid username or password" si no existe en el proyecto. **El agente nunca escribe contraseñas**:
-  las carga el usuario en Studio.
+  las carga el usuario en Studio. Con `AutoLoginMode = 5` (credenciales guardadas; el valor que dejó el Wizard) el
+  cliente muestra "Log in to display client" y **Cancel cierra el cliente** (verificado el 2026-11-27, aunque la
+  ayuda dice que solo el modo 4 cierra): Runtime Manager relanza los servidores pero no el cliente, y CtAPI da 233
+  hasta que alguien entra.
 - `po_cicode_run`: ejecuta en el runtime; los argumentos de cadena van entre comillas:
   `TagRead("Feeder1\MMXU1\TotW")`. El resultado vuelve como texto. En modo solo lectura solo se permiten
   funciones de consulta.
@@ -273,7 +295,10 @@ END
 
 - STATE y las descripciones de estado llegan **traducidas al idioma del runtime** (p. ej. "ACTIVADO", "DESACT.",
   "ALTO"): no compararlas contra textos en inglés.
-- Errores: "error Citect N" = código de Cicode/CtAPI; "error Windows N" = sistema. Frecuentes (verificado):
+- Errores: "error Citect N" = código de Cicode/CtAPI, con su título en inglés de la tabla "Cicode and General
+  Errors" de la ayuda (243 códigos; 1–31 son errores del dispositivo de I/O); "error Windows N" = sistema. Según la
+  ayuda de CtAPI, un error Windows indica conexión perdida y uno Citect, un pedido inválido con la conexión sana.
+  Frecuentes (verificado):
   424 tag no encontrado, 274 argumento inválido, 292 función inexistente (o identificador inválido),
   Windows 233 sin conexión con el cliente del runtime (transitorio tras un reinicio del cliente).
 
@@ -310,6 +335,10 @@ END
   chequeo en las opciones de Studio). **El Wizard reescribe el citect.ini y puede volver a poner `Run=` en otro
   proyecto** (verificado): revisá `Run=` después. `po_tag_read` con `samples` y `po_tag_write` en lote, verificados
   con el runtime real.
+  En la página "Project Setup" (Local Engineering Environment) el Wizard **no lista todos los proyectos**: el
+  2026-11-27 MCP_Demo no aparecía (su compilación era del 14/10 y tenía páginas cambiadas después) y apareció tras
+  compilarlo con `po_project_compile`. Si el proyecto no está en la lista, compilarlo primero. Criterio exacto no
+  verificado (Transferencia_Ejemplo, compilado al día, tampoco aparecía).
 - `Shutdown()` por `po_cicode_run` devolvió 274 y no hizo nada **(verificado)**. Al recompilar el proyecto que corre,
   Runtime Manager **a veces** reinicia el runtime solo (todos los Citect32 con PID nuevo; visto el 2026-10-14). El
   2026-10-15 no lo hizo en tres compilaciones de `Transferencia_Demo` corriendo, con y sin Studio abierto (misma PID).

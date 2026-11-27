@@ -9,7 +9,10 @@ use serde_json::{Map, Value, json};
 
 use crate::alarmdb;
 use crate::cicode;
-use crate::ctapi::{FindResult, Session, is_restarting_error};
+use crate::ctapi::{
+    FindResult, Quality, Session, TagReading, is_restarting_error, quality_extended_name, quality_general_name, quality_limit_name,
+    quality_substatus_name,
+};
 use crate::server::{PowerOpServer, ToolResult, blocking, err};
 use crate::text::truncate;
 
@@ -124,6 +127,118 @@ pub struct TagReadParams {
     /// (samples - 1) × interval_secs, máximo 300 s.
     #[serde(default)]
     pub interval_secs: Option<f64>,
+    /// Agregar propiedades del tag (ctTagGetProperty): unidades, descripción, rango de ingeniería y tipo.
+    /// Una llamada más por propiedad y tag; solo en la lectura simple (sin samples).
+    #[serde(default)]
+    pub details: bool,
+}
+
+/// FILETIME (100 ns desde 1601, UTC) → hora local RFC 3339 con milisegundos. `None` = sin hora (0).
+/// Fuera de 1990–2200 (no parece una hora) se devuelve el número crudo.
+fn filetime_json(ft: u64) -> Option<Value> {
+    const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
+    if ft == 0 {
+        return None;
+    }
+    let secs = (ft / 10_000_000) as i64 - EPOCH_DIFF_SECS;
+    let nanos = ((ft % 10_000_000) * 100) as u32;
+    match DateTime::from_timestamp(secs, nanos) {
+        Some(t) if (631_152_000..7_258_118_400).contains(&secs) => {
+            Some(json!(t.with_timezone(&Local).to_rfc3339_opts(chrono::SecondsFormat::Millis, false)))
+        }
+        _ => Some(json!(ft)),
+    }
+}
+
+/// Calidad corta: "GOOD", "BAD/COMM_FAILURE", "UNCERTAIN/LAST_USABLE_VALUE"... (con el subestado si no es NON_SPECIFIC).
+fn quality_label(q: &Quality) -> String {
+    let general = quality_general_name(q.general).map(str::to_string).unwrap_or_else(|| format!("Q{}", q.general));
+    match q.substatus {
+        0 => general,
+        s => format!("{general}/{}", quality_substatus_name(q.general, s).map(str::to_string).unwrap_or_else(|| s.to_string())),
+    }
+}
+
+/// `true` si la calidad no es un GOOD sin más (subestado, límite, extendido, error, override o control inhibit).
+fn quality_noteworthy(q: &Quality) -> bool {
+    q.general != 3 || q.substatus != 0 || q.limit != 0 || q.extended != 0 || q.datasource_error != 0 || q.overridden || q.control_inhibit
+}
+
+/// JSON de una lectura: valor, calidad (con detalle si no es GOOD a secas) y horas.
+fn reading_json(tag: &str, r: &TagReading) -> Value {
+    let mut o = Map::new();
+    o.insert("tag".into(), json!(tag));
+    o.insert("value".into(), json!(r.value));
+    if let Some(q) = &r.quality {
+        o.insert("quality".into(), json!(quality_label(q)));
+        if quality_noteworthy(q) {
+            let mut d = Map::new();
+            if q.limit != 0 {
+                d.insert("limit".into(), quality_limit_name(q.limit).map_or_else(|| json!(q.limit), |n| json!(n)));
+            }
+            if q.extended != 0 {
+                d.insert("extended".into(), quality_extended_name(q.extended).map_or_else(|| json!(q.extended), |n| json!(n)));
+            }
+            if q.datasource_error != 0 {
+                d.insert("datasource_error".into(), json!(q.datasource_error));
+            }
+            if q.overridden {
+                d.insert("override".into(), json!(true));
+            }
+            if q.control_inhibit {
+                d.insert("control_inhibit".into(), json!(true));
+            }
+            if let Some(t) = filetime_json(r.quality_timestamp) {
+                d.insert("quality_timestamp".into(), t);
+            }
+            if !d.is_empty() {
+                o.insert("quality_detail".into(), Value::Object(d));
+            }
+        }
+    }
+    if let Some(t) = filetime_json(r.timestamp) {
+        o.insert("timestamp".into(), t);
+    }
+    if r.value_timestamp != r.timestamp
+        && let Some(t) = filetime_json(r.value_timestamp)
+    {
+        o.insert("value_timestamp".into(), t);
+    }
+    Value::Object(o)
+}
+
+/// Nombre del Type de ctTagGetProperty (0 Digital ... 8 Undefined, según la ayuda).
+fn tag_property_type_name(code: &str) -> Option<&'static str> {
+    Some(match code.trim() {
+        "0" => "DIGITAL",
+        "1" => "BYTE",
+        "2" => "INT",
+        "3" => "UINT",
+        "4" => "LONG",
+        "5" => "REAL",
+        "6" => "STRING",
+        "7" => "ULONG",
+        "8" => "UNDEFINED",
+        _ => return None,
+    })
+}
+
+/// Propiedades de `details`: (propiedad de ctTagGetProperty, campo del JSON).
+const DETAIL_PROPS: [(&str, &str); 5] =
+    [("Units", "units"), ("Description", "description"), ("EngUnitsLow", "eng_low"), ("EngUnitsHigh", "eng_high"), ("Type", "type")];
+
+/// Agrega a `o` las propiedades del tag que el runtime devuelva (las vacías se omiten).
+fn add_details(s: &Session, tag: &str, o: &mut Map<String, Value>) {
+    for (prop, key) in DETAIL_PROPS {
+        let Some(v) = s.tag_property(tag, prop).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        if prop == "Type" {
+            o.insert("type".into(), json!(tag_property_type_name(&v).unwrap_or(v.as_str())));
+        } else {
+            o.insert(key.into(), json!(v));
+        }
+    }
 }
 
 /// Máximo de escrituras por llamada de po_tag_write y de tags por muestra repetida de po_tag_read.
@@ -231,10 +346,14 @@ fn fail_all(items: &[(String, String)], e: &anyhow::Error) -> Vec<WriteOutcome> 
         .collect()
 }
 
-/// Valor de un tag para tag_watch: el texto leído o "error: ..." (un tag fallido no corta la muestra).
-fn tag_value(s: &Session, tag: &str) -> String {
-    match s.tag_read(tag) {
-        Ok(v) => v,
+/// Valor de un tag para tag_watch: el texto leído, con la calidad entre corchetes si no es GOOD (así un tag que
+/// pierde la comunicación cuenta como cambio), o "error: ..." (un tag fallido no corta la muestra).
+fn watch_text(r: anyhow::Result<TagReading>) -> String {
+    match r {
+        Ok(r) => match &r.quality {
+            Some(q) if q.general != 3 => format!("{} [{}]", r.value, quality_label(q)),
+            _ => r.value,
+        },
         Err(e) => format!("error: {e:#}"),
     }
 }
@@ -448,7 +567,7 @@ pub struct AlarmSqlParams {
 
 #[tool_router(router = runtime_router, vis = "pub(crate)")]
 impl PowerOpServer {
-    #[tool(name = "po_tag_read", description = "Lee el valor actual de uno o varios tags (en unidades de ingeniería, como texto). Con samples y/o interval_secs lee los tags N veces (solo lectura) para verificar secuencias, p. ej. una transferencia o un interruptor: cada muestra es UNA llamada a CtAPI con todos los tags (máximo 50 tags, 120 muestras, intervalo mínimo 0.2 s, duración máxima 300 s); devuelve las muestras con hora (HH:MM:SS.mmm) y, por tag, los valores distintos, el número de cambios y la hora del primer cambio.")]
+    #[tool(name = "po_tag_read", description = "Lee el valor actual de uno o varios tags (en unidades de ingeniería, como texto) con su calidad (GOOD, BAD/COMM_FAILURE...; quality_detail si hay override, control inhibit, límite o subestado extendido) y la hora de la última actualización. Varios tags se leen en un solo pedido (ctListRead), todos del mismo instante. details=true agrega unidades, descripción, rango de ingeniería y tipo. Con samples y/o interval_secs lee los tags N veces (solo lectura) para verificar secuencias, p. ej. una transferencia o un interruptor: cada muestra es UNA llamada a CtAPI con todos los tags (máximo 50 tags, 120 muestras, intervalo mínimo 0.2 s, duración máxima 300 s); devuelve las muestras con hora (HH:MM:SS.mmm) y, por tag, los valores distintos, el número de cambios y la hora del primer cambio.")]
     async fn tag_read(&self, Parameters(p): Parameters<TagReadParams>) -> ToolResult {
         if p.samples.is_some() || p.interval_secs.is_some() {
             return self.tag_watch(p).await;
@@ -456,14 +575,22 @@ impl PowerOpServer {
         if p.tags.is_empty() {
             return Err("Indicá al menos un tag".into());
         }
+        let details = p.details;
         let r = self
             .ct
             .call_retry(move |s| {
                 Ok(p.tags
                     .iter()
-                    .map(|t| match s.tag_read(t) {
-                        Ok(v) => json!({"tag": t, "value": v}),
-                        Err(e) => json!({"tag": t, "error": format!("{e:#}")}),
+                    .zip(s.read_many(&p.tags))
+                    .map(|(t, r)| {
+                        let mut v = match r {
+                            Ok(r) => reading_json(t, &r),
+                            Err(e) => json!({"tag": t, "error": format!("{e:#}")}),
+                        };
+                        if details && let Some(o) = v.as_object_mut() {
+                            add_details(s, t, o);
+                        }
+                        v
                     })
                     .collect::<Vec<_>>())
             })
@@ -533,13 +660,21 @@ impl PowerOpServer {
             .call_retry(move |s| {
                 let mut r = s.find("Tag", &filter, cluster.as_deref(), &props2, limit)?;
                 if with_values {
-                    for row in r.rows.iter_mut() {
-                        let name = row.get("TAG").and_then(Value::as_str).map(str::to_string);
-                        if let (Some(name), Some(o)) = (name, row.as_object_mut()) {
-                            o.insert("VALUE".into(), match s.tag_read(&name) {
-                                Ok(v) => json!(v),
-                                Err(e) => json!(format!("error: {e:#}")),
-                            });
+                    let names: Vec<String> =
+                        r.rows.iter().map(|row| row.get("TAG").and_then(Value::as_str).unwrap_or("").to_string()).collect();
+                    for ((row, name), read) in r.rows.iter_mut().zip(&names).zip(s.read_many(&names)) {
+                        if let (false, Some(o)) = (name.is_empty(), row.as_object_mut()) {
+                            match read {
+                                Ok(v) => {
+                                    o.insert("VALUE".into(), json!(v.value));
+                                    if let Some(q) = &v.quality {
+                                        o.insert("QUALITY".into(), json!(quality_label(q)));
+                                    }
+                                }
+                                Err(e) => {
+                                    o.insert("VALUE".into(), json!(format!("error: {e:#}")));
+                                }
+                            }
                         }
                     }
                 }
@@ -559,6 +694,7 @@ impl PowerOpServer {
         }
         if with_values {
             props.push("VALUE".into());
+            props.push("QUALITY".into());
         }
         pretty(&find_json(r, &props), 80_000)
     }
@@ -762,7 +898,8 @@ impl PowerOpServer {
                 tokio::time::sleep(std::time::Duration::from_secs_f64(interval)).await;
             }
             let names = p.tags.clone();
-            match self.ct.call_retry(move |s| Ok(names.iter().map(|t| (t.clone(), tag_value(s, t))).collect::<Vec<_>>())).await {
+            let read = move |s: &Session| Ok(names.iter().cloned().zip(s.read_many(&names).into_iter().map(watch_text)).collect::<Vec<_>>());
+            match self.ct.call_retry(read).await {
                 Ok(values) => taken.push(WatchSample { t: now_stamp(), values }),
                 Err(e) => {
                     interrupted = Some(format!("{e:#}"));
@@ -803,6 +940,51 @@ mod tests {
         assert_eq!(quality_desc(0x02), "bad");
         assert_eq!(quality_desc(0x00), "none");
         assert_eq!(quality_desc(0x14), "good");
+    }
+
+    /// 2026-11-27T10:00:00Z como FILETIME.
+    const FT: u64 = (1_795_773_600 + 11_644_473_600) * 10_000_000;
+
+    #[test]
+    fn horas_filetime() {
+        assert_eq!(filetime_json(0), None);
+        let t = filetime_json(FT + 1_230_000).unwrap();
+        let back = DateTime::parse_from_rfc3339(t.as_str().unwrap()).unwrap();
+        assert_eq!(back.timestamp(), 1_795_773_600);
+        assert_eq!(back.timestamp_subsec_millis(), 123);
+        // Algo que no parece una hora sale crudo.
+        assert_eq!(filetime_json(42), Some(json!(42)));
+    }
+
+    #[test]
+    fn lectura_en_json() {
+        let good = Quality { general: 3, ..Default::default() };
+        let r = TagReading { value: "12.5".into(), quality: Some(good), timestamp: FT, value_timestamp: FT, quality_timestamp: FT };
+        let j = reading_json("T", &r);
+        assert_eq!(j["quality"], "GOOD");
+        assert!(j.get("quality_detail").is_none() && j.get("value_timestamp").is_none());
+        assert!(j["timestamp"].is_string());
+
+        let bad = Quality { general: 0, substatus: 6, extended: 0x11, overridden: true, ..Default::default() };
+        let r = TagReading { value: "0".into(), quality: Some(bad), timestamp: FT, value_timestamp: FT - 600_000_000, quality_timestamp: FT };
+        let j = reading_json("T", &r);
+        assert_eq!(j["quality"], "BAD/COMM_FAILURE");
+        assert_eq!(j["quality_detail"]["extended"], "COMM_DEV_BAD");
+        assert_eq!(j["quality_detail"]["override"], true);
+        assert!(j["value_timestamp"].is_string());
+
+        // Sin ctTagReadEx (DLL viejo): solo el valor.
+        let j = reading_json("T", &TagReading { value: "1".into(), ..Default::default() });
+        assert_eq!(j, json!({"tag": "T", "value": "1"}));
+    }
+
+    #[test]
+    fn muestra_con_calidad() {
+        let bad = Quality { general: 0, substatus: 6, ..Default::default() };
+        assert_eq!(watch_text(Ok(TagReading { value: "1".into(), quality: Some(bad), ..Default::default() })), "1 [BAD/COMM_FAILURE]");
+        let good = Quality { general: 3, ..Default::default() };
+        assert_eq!(watch_text(Ok(TagReading { value: "1".into(), quality: Some(good), ..Default::default() })), "1");
+        assert!(watch_text(Err(anyhow::anyhow!("x"))).starts_with("error: "));
     }
 
     fn tw(tag: Option<&str>, value: Option<&str>, writes: Option<Vec<(&str, &str)>>) -> TagWriteParams {
