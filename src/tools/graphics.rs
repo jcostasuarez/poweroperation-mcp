@@ -1156,6 +1156,9 @@ pub(crate) fn with_project(gb: &mut Session, project: &str, cat: &Catalog, needs
     }
     if let Err(e) = select_project(gb, project) {
         let _ = gb.m("ProjectSelect", &[s(&prev)]);
+        if format!("{e:#}").contains("no conoce el proyecto") {
+            bail!("{e:#}");
+        }
         bail!(
             "Graphics Builder tiene seleccionado {prev} y desde ahí no ve las librerías de {project}; {e:#}. Graphics Builder no \
              cambia de proyecto con páginas abiertas: cerralas (po_gb_status → open_pages, incluida la Untitled) o seleccioná \
@@ -1231,6 +1234,16 @@ pub(crate) fn gb_projects(gb: &mut Session) -> Vec<String> {
 
 /// `ProjectSelect` y espera hasta 10 s a que `ProjectSelected` lo refleje.
 pub(crate) fn select_project(gb: &mut Session, project: &str) -> Result<()> {
+    // Graphics Builder carga la lista de proyectos al abrir: uno creado después (p. ej. con po_project_create) no
+    // está y ProjectSelect no hace nada (visto el 2026-11-27 con un proyecto recién creado).
+    let known = gb_projects(gb);
+    if !known.is_empty() && !known.iter().any(|p| p.eq_ignore_ascii_case(project)) {
+        bail!(
+            "Graphics Builder no conoce el proyecto {project} (carga la lista de proyectos al abrir; si se creó después, \
+             hay que cerrar y volver a abrir Graphics Builder, con el OK del usuario). Proyectos que ve: {}",
+            known.join(", ")
+        );
+    }
     gb.m("ProjectSelect", &[s(project)])?;
     let t0 = std::time::Instant::now();
     loop {
