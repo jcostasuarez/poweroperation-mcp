@@ -71,6 +71,8 @@ pub const TOOLS: &[(&str, &[Bridge])] = &[
     ("po_project_graphics", &[Disco]),
     ("po_oneline_read", &[Disco]),
     ("po_oneline_validate", &[Disco]),
+    // El plan (apply=false) es offline; apply=true comprueba Graphics Builder al usarlo.
+    ("po_oneline_clone", &[Disco, Escritura]),
     ("po_cicode_files", &[Disco]),
     ("po_cicode_read", &[Disco]),
     ("po_cicode_check", &[Disco]),

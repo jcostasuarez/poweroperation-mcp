@@ -1,11 +1,13 @@
-//! Advanced One-Line (offline, solo lectura): `po_oneline_read` y `po_oneline_validate`. Leen los `.ctg` del
-//! proyecto con `ctg.rs` (sin Graphics Builder), así que ven también los genies ocultos y los de dentro de grupos.
+//! Advanced One-Line: `po_oneline_read` y `po_oneline_validate` (offline, solo lectura) leen los `.ctg` del proyecto
+//! con `ctg.rs` (sin Graphics Builder), así que ven también los genies ocultos y los de dentro de grupos.
+//! `po_oneline_clone` arma el plan offline (`oneline_clone.rs`), lo aplica con Graphics Builder y verifica el `.ctg`
+//! guardado.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
@@ -13,11 +15,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::dbf::Dbf;
+use crate::gb::Arg;
 use crate::oneline::{self, Context, Item, Kind};
+use crate::oneline_clone::{self, Numbering, Numbers, Rules, Space};
 use crate::project::{self, Project};
 use crate::server::{PowerOpServer, ToolResult, blocking, err};
 use crate::text::{filter_match, truncate};
 use crate::{ctg, text};
+
+use super::graphics::{close_page, is_open, library_project, page_objects, warnings_json, with_project};
 
 /// Proyectos cuyas páginas no se recorren (como la One-Line Configuration Utility: strDoNotIterateProjects y
 /// strDoNotDisplayProjects de OneLineConfig.exe.config).
@@ -70,6 +76,55 @@ pub struct OneLineValidateParams {
     /// Máximo de hallazgos en la respuesta (por defecto 500).
     #[serde(default)]
     pub max_findings: Option<usize>,
+}
+
+/// Reemplazo de texto para po_oneline_clone.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CloneReplace {
+    /// Texto a buscar (sin distinguir mayúsculas), p. ej. el prefijo de la estación de origen "EstA_".
+    pub from: String,
+    /// Texto que lo reemplaza, p. ej. "EstB_".
+    pub to: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct OneLineCloneParams {
+    /// Proyecto donde se crea la página nueva. Vacío = POWEROP_PROJECT / el que corre en runtime.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Página de origen (nombre exacto, sin .ctg).
+    pub source_page: String,
+    /// Proyecto de la página de origen. Vacío = se busca en el proyecto y sus incluidos.
+    #[serde(default)]
+    pub source_project: Option<String>,
+    /// Nombre de la página nueva (no tiene que existir en el proyecto ni en sus incluidos).
+    pub page: String,
+    /// Cómo renumerar los números zOL: "next_free" (por defecto: desde el mayor usado + 1, o desde `start`,
+    /// saltando los usados), "offset" (viejo + `offset`; error si alguno ya está usado) o "keep" (no renumerar).
+    #[serde(default)]
+    pub renumber: Option<String>,
+    /// Con next_free: primer número a probar.
+    #[serde(default)]
+    pub start: Option<u32>,
+    /// Con offset: lo que se suma a cada número.
+    #[serde(default)]
+    pub offset: Option<u32>,
+    /// Espacios a renumerar: bkr (BkrNum, BkrNum1/2), bus (BusbarNum, SrcBusbarNum, DestBusbarNum...), mtr (MtrNum),
+    /// src (SrcNum, SimSrcNum). Vacío = todos. Sin "bus", la página nueva queda conectada a las mismas barras.
+    #[serde(default)]
+    pub spaces: Option<Vec<String>>,
+    /// Reemplazos de texto en las demás propiedades de los genies (Equip, Active, DetailsFn...), en orden, sin
+    /// distinguir mayúsculas. P. ej. [{"from": "EstA_", "to": "EstB_"}].
+    #[serde(default)]
+    pub replace: Option<Vec<CloneReplace>>,
+    /// false (por defecto): solo devuelve el plan, sin Graphics Builder ni escrituras. true: crea la página.
+    #[serde(default)]
+    pub apply: Option<bool>,
+    /// Guardar aunque Graphics Builder vea menos cambios que el plan (genies dentro de grupos, que no puede editar):
+    /// esos quedan con los números y textos de origen. Por defecto false: no se guarda nada.
+    #[serde(default)]
+    pub allow_partial: Option<bool>,
 }
 
 fn pretty(v: &Value, max: usize) -> ToolResult {
@@ -161,6 +216,185 @@ fn unparsed_json(s: &Scan) -> Value {
         .map(|p| json!({"project": p.project, "page": p.page, "genies": p.unparsed}))
         .collect();
     json!(list)
+}
+
+/// Plan de un clonado, armado offline.
+struct ClonePlan {
+    source: Vec<ctg::GenieInstance>,
+    rules: Rules,
+    planned: usize,
+    json: Value,
+}
+
+/// Números zOL (letras + número) de un tag `zOL\Bkr12`.
+fn zol_number(tag: &str) -> Option<(Space, u32)> {
+    let rest = tag.get(4..)?;
+    let digits = rest.find(|c: char| c.is_ascii_digit())?;
+    let sp = match rest[..digits].to_ascii_lowercase().as_str() {
+        "bkr" => Space::Bkr,
+        "bus" => Space::Bus,
+        "mtr" => Space::Mtr,
+        "src" => Space::Src,
+        _ => return None,
+    };
+    Some((sp, rest[digits..].parse().ok()?))
+}
+
+/// Hallazgos de po_oneline_validate que tocan a `page` de `project`, con la página dada en `extra` sumada al resto.
+fn page_findings(scan: &Scan, project: &str, page: &str, extra: Vec<Item>, refs: &[(String, String)], ctx: &Context) -> Vec<Value> {
+    let mut items: Vec<Item> = scan
+        .pages
+        .iter()
+        .filter(|pg| !(pg.project.eq_ignore_ascii_case(project) && pg.page.eq_ignore_ascii_case(page)))
+        .flat_map(|pg| pg.items.iter().cloned())
+        .collect();
+    let first = items.len();
+    items.extend(extra);
+    let busbars = oneline::known_buses(&items);
+    let own: Vec<&Item> = items[first..].iter().collect();
+    let mut f = oneline::validate(&items, ctx);
+    f.extend(oneline::stale_refs(project, page, &own, &busbars, refs));
+    f.iter()
+        .filter(|x| x.at.iter().any(|a| a["page"].as_str().is_some_and(|p| p.eq_ignore_ascii_case(page)) && a["project"].as_str().is_some_and(|p| p.eq_ignore_ascii_case(project))))
+        .map(|x| x.json())
+        .collect()
+}
+
+fn page_items(project: &str, page: &str, genies: &[ctg::GenieInstance]) -> Vec<Item> {
+    genies
+        .iter()
+        .filter_map(|g| oneline::classify(g).map(|kind| Item { project: project.into(), page: page.into(), kind, genie: g.clone() }))
+        .collect()
+}
+
+/// Lee la página de origen y el proyecto destino y arma el plan (números nuevos, cambios por genie, hallazgos
+/// esperados en la página nueva).
+#[allow(clippy::too_many_arguments)]
+fn clone_plan(
+    src_project: &str, src_page: &str, src_file: &Path, dest: &[Project], page: &str, numbering: &Numbering, spaces: &[Space],
+    replace: Vec<(String, String)>,
+) -> Result<ClonePlan> {
+    let data = std::fs::read(src_file)?;
+    let g = ctg::genies(&data);
+    let mut source = Numbers::new();
+    for x in &g.genies {
+        oneline_clone::add_numbers(&x.properties, &mut source);
+    }
+    let projects = page_projects(dest.to_vec(), true);
+    let s = scan(&projects, &[]);
+    let mut used = Numbers::new();
+    for pg in &s.pages {
+        for i in &pg.items {
+            oneline_clone::add_numbers(&i.genie.properties, &mut used);
+        }
+    }
+    let csv = read_csv(&dest[0].path);
+    if let Some((_, rows)) = &csv {
+        oneline_clone::add_csv(rows, &mut used);
+    }
+    let maps = oneline_clone::allocate(&source, &used, spaces, numbering)?;
+    let rules = Rules { maps, replace };
+    let mut planned = 0;
+    let mut changes = Vec::new();
+    let mut odd = Vec::new();
+    for (i, x) in g.genies.iter().enumerate() {
+        let ch = oneline_clone::changes(&x.properties, &rules);
+        planned += ch.len();
+        for (k, v) in oneline_clone::non_numeric(&x.properties) {
+            odd.push(json!({"index": i, "genie": format!("{}.{}", x.library, x.genie), "an": x.prop("AN"), "property": k, "value": v}));
+        }
+        if !ch.is_empty() {
+            let kind = oneline::classify(x).map(|k| k.name());
+            changes.push(json!({"index": i, "genie": format!("{}.{}", x.library, x.genie), "kind": kind, "an": x.prop("AN"), "changes": ch.iter().map(|c| c.json()).collect::<Vec<_>>()}));
+        }
+    }
+    // Tags zOL de la página que no salen de las propiedades de sus genies: Graphics Builder no los renumera.
+    let refs = ctg::zol_refs(&data);
+    let manual: Vec<Value> = refs
+        .iter()
+        .filter(|(t, _)| zol_number(t).is_some_and(|(sp, n)| rules.maps.contains_key(&sp) && !source.get(&sp).is_some_and(|s| s.contains(&n))))
+        .map(|(t, e)| json!({"tag": t, "expression": e}))
+        .collect();
+    let simulated: Vec<ctg::GenieInstance> = g.genies.iter().map(|x| oneline_clone::apply(x, &rules)).collect();
+    let ctx = Context {
+        equipment: names(dest, "equip"),
+        tags: names(dest, "variable"),
+        csv: None,
+        foreign: rules.replace.iter().map(|(f, _)| f.clone()).collect(),
+        equip_prefix: None,
+    };
+    let dest_name = dest[0].name.clone();
+    let expected = page_findings(&s, &dest_name, page, page_items(&dest_name, page, &simulated), &[], &ctx);
+    let used_max: BTreeMap<&str, Option<u32>> = Space::ALL.iter().map(|sp| (sp.name(), used.get(sp).and_then(|s| s.iter().next_back().copied()))).collect();
+    let mut warnings: Vec<String> = Vec::new();
+    if !g.unparsed.is_empty() {
+        warnings.push(format!(
+            "{} genies de la página de origen no se pudieron leer offline ({}): el plan no los incluye y Graphics Builder puede cambiar \
+             más propiedades que las del plan.",
+            g.unparsed.len(),
+            g.unparsed.join(", ")
+        ));
+    }
+    if !odd.is_empty() {
+        warnings.push("Hay propiedades de numeración que no son un número (non_numeric_numbers): no se renumeran.".into());
+    }
+    if !manual.is_empty() {
+        warnings.push("Hay tags zOL escritos a mano en expresiones de la página (manual_zol_refs): no se renumeran; corregilos después con po_gb_page_edit.".into());
+    }
+    let json = json!({
+        "source": {"project": src_project, "page": src_page, "genies": g.genies.len(), "oneline_objects": page_items(src_project, src_page, &g.genies).len()},
+        "target": {"project": dest_name, "page": page},
+        "renumber": {"mode": match numbering { Numbering::NextFree { .. } => "next_free", Numbering::Offset(_) => "offset", Numbering::Keep => "keep" },
+                     "spaces": spaces.iter().map(|s| s.name()).collect::<Vec<_>>(), "used_max": used_max, "maps": oneline_clone::maps_json(&rules.maps)},
+        "replace": rules.replace.iter().map(|(f, t)| json!({"from": f, "to": t})).collect::<Vec<_>>(),
+        "total_changes": planned,
+        "changes": changes,
+        "non_numeric_numbers": odd,
+        "manual_zol_refs": manual,
+        "expected_findings": expected,
+        "warnings": warnings,
+    });
+    Ok(ClonePlan { source: g.genies, rules, planned, json })
+}
+
+/// Después de guardar: compara el .ctg nuevo con el plan y valida la página nueva contra el resto del proyecto.
+fn clone_verify(plan_source: &[ctg::GenieInstance], rules: &Rules, dest: &[Project], page: &str) -> Value {
+    let Some(file) = project::find_file(&dest[0].path, &format!("{page}.ctg")) else {
+        return json!({"ok": false, "error": format!("no se encontró {page}.ctg en {} después de guardar", dest[0].name)});
+    };
+    let data = match std::fs::read(&file) {
+        Ok(d) => d,
+        Err(e) => return json!({"ok": false, "error": format!("no se pudo leer {}: {e}", file.display())}),
+    };
+    let saved = ctg::genies(&data);
+    let not_applied = oneline_clone::not_applied(plan_source, &saved.genies, rules);
+    let leftovers: Vec<Value> = rules
+        .replace
+        .iter()
+        .map(|(f, _)| (f, ctg::strings_containing(&data, f, 20)))
+        .filter(|(_, l)| !l.is_empty())
+        .map(|(f, l)| json!({"text": f, "strings": l}))
+        .collect();
+    let dest_name = dest[0].name.clone();
+    let s = scan(&page_projects(dest.to_vec(), true), &[]);
+    let ctx = Context {
+        equipment: names(dest, "equip"),
+        tags: names(dest, "variable"),
+        csv: None,
+        foreign: rules.replace.iter().map(|(f, _)| f.clone()).collect(),
+        equip_prefix: None,
+    };
+    let findings = page_findings(&s, &dest_name, page, page_items(&dest_name, page, &saved.genies), &ctg::zol_refs(&data), &ctx);
+    let errors = findings.iter().filter(|f| f["severity"] == "error").count();
+    let ok = not_applied.as_ref().is_ok_and(|v| v.is_empty()) && leftovers.is_empty() && errors == 0;
+    json!({
+        "ok": ok,
+        "file": file.display().to_string(),
+        "not_applied": match &not_applied { Ok(v) => json!(v), Err(e) => json!({"error": e}) },
+        "leftovers": leftovers,
+        "findings": findings,
+        "unparsed_genies": saved.unparsed,
+    })
 }
 
 #[tool_router(router = oneline_router, vis = "pub(crate)")]
@@ -281,6 +515,161 @@ impl PowerOpServer {
         })
         .await
         .map_err(err)?;
+        pretty(&v, 200_000)
+    }
+
+    #[tool(name = "po_oneline_clone", description = "Clona una página del Advanced One-Line con números zOL nuevos: copia la página de origen con Graphics Builder y en cada genie renumera BkrNum/BusbarNum/MtrNum/SrcNum y las barras de origen/destino (mismo número viejo → mismo número nuevo, sin repetir los usados en el proyecto ni en AdvOneLine.csv) y reemplaza textos en las demás propiedades (Equip, Active, DetailsFn...: `replace` EstA_ → EstB_). Con apply=false (por defecto) solo devuelve el plan, offline: números nuevos, cambios por genie y lo que po_oneline_validate encontraría en la página nueva. Con apply=true guarda la página nueva (no toca la de origen) y la verifica leyendo el .ctg guardado. Confirmá el plan con el usuario antes de apply=true. Requiere POWEROP_ALLOW_WRITE=1.")]
+    async fn oneline_clone(&self, Parameters(p): Parameters<OneLineCloneParams>) -> ToolResult {
+        self.require_write("oneline_clone").map_err(err)?;
+        let apply = p.apply.unwrap_or(false);
+        let allow_partial = p.allow_partial.unwrap_or(false);
+        let page = p.page.trim().to_string();
+        let src_page = p.source_page.trim().to_string();
+        if page.is_empty() || src_page.is_empty() {
+            return Err("Indicá source_page y page".into());
+        }
+        let numbering = match p.renumber.as_deref().map(str::trim).unwrap_or("next_free") {
+            "next_free" => Numbering::NextFree { start: p.start },
+            "offset" => Numbering::Offset(p.offset.filter(|o| *o > 0).ok_or("renumber=\"offset\" necesita `offset` mayor que 0")?),
+            "keep" => Numbering::Keep,
+            o => return Err(format!("renumber '{o}' no existe: usá next_free, offset o keep")),
+        };
+        if p.start.is_some() && !matches!(numbering, Numbering::NextFree { .. }) || p.offset.is_some() && !matches!(numbering, Numbering::Offset(_)) {
+            return Err("`start` va con renumber=\"next_free\" y `offset` con renumber=\"offset\"".into());
+        }
+        let spaces: Vec<Space> = match &p.spaces {
+            Some(l) if !l.is_empty() => l
+                .iter()
+                .map(|s| Space::parse(s).ok_or_else(|| format!("espacio '{s}' no existe: usá bkr, bus, mtr o src")))
+                .collect::<Result<_, _>>()?,
+            _ => Space::ALL.to_vec(),
+        };
+        let replace: Vec<(String, String)> = p.replace.clone().unwrap_or_default().into_iter().filter(|r| !r.from.is_empty()).map(|r| (r.from, r.to)).collect();
+
+        let dest = self.project(p.project.as_deref()).await.map_err(err)?;
+        super::graphics::check_writable(&dest.name).map_err(err)?;
+        let cat = self.catalog(false).await.map_err(err)?;
+        let (dest_all, _) = cat.with_includes(&dest);
+        let ctg_name = format!("{src_page}.ctg");
+        let (src_proj, src_file) = match p.source_project.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(n) => {
+                let sp = cat.resolve(n).map_err(err)?;
+                let f = project::find_file(&sp.path, &ctg_name).ok_or_else(|| format!("No existe la página {src_page} en {}", sp.name))?;
+                (sp, f)
+            }
+            None => dest_all
+                .iter()
+                .find_map(|pr| project::find_file(&pr.path, &ctg_name).map(|f| (pr.clone(), f)))
+                .ok_or_else(|| format!("No existe la página {src_page} en {} ni en sus incluidos (indicá source_project)", dest.name))?,
+        };
+        if let Some(pr) = dest_all.iter().find(|pr| project::find_file(&pr.path, &format!("{page}.ctg")).is_some()) {
+            return Err(format!("La página {page} ya existe en {}: elegí otro nombre (po_oneline_clone no reemplaza páginas)", pr.name));
+        }
+
+        let (sname, dall, pg, sp) = (src_proj.name.clone(), dest_all.clone(), page.clone(), src_page.clone());
+        let plan = blocking(Duration::from_secs(120), move || clone_plan(&sname, &sp, &src_file, &dall, &pg, &numbering, &spaces, replace))
+            .await
+            .map_err(err)?;
+        let mut v = plan.json.clone();
+        if !apply {
+            v["applied"] = json!(false);
+            v["next_step"] = json!("Revisá el plan con el usuario (números nuevos, cambios, expected_findings) y repetí con apply=true.");
+            return pretty(&v, 200_000);
+        }
+
+        if !blocking(Duration::from_secs(10), || Ok(crate::gb::registered())).await.unwrap_or(false) {
+            return Err("apply=true necesita Graphics Builder (puente GB: Power Operation Studio instalado y registrado). El plan de arriba                         se puede armar sin él (apply=false)."
+                .into());
+        }
+        let detail = format!("{}/{src_page} → {}/{page} ({} cambios en propiedades)", src_proj.name, dest.name, plan.planned);
+        let (sname, dname, spage, npage) = (src_proj.name.clone(), dest.name.clone(), src_page.clone(), page.clone());
+        let (rules, planned) = (plan.rules.clone(), plan.planned);
+        // Graphics Builder tiene que ver el proyecto de origen y las librerías de los genies de la página.
+        let mut needs = vec![sname.clone()];
+        for g in &plan.source {
+            if let Some(lp) = library_project(&dest_all, &g.library, "ctm")
+                && !needs.iter().any(|n| n.eq_ignore_ascii_case(&lp))
+            {
+                needs.push(lp);
+            }
+        }
+        let r = self
+            .gb
+            .call(move |gb| {
+                gb.ensure(None)?;
+                with_project(gb, &dname, &cat, &needs, |gb| {
+                    if is_open(gb, &sname, &spage) {
+                        bail!(
+                            "La página de origen {sname}/{spage} está abierta en Graphics Builder: guardala o cerrala y repetí (el clon se arma \
+                             abriéndola y guardándola con otro nombre)."
+                        );
+                    }
+                    if is_open(gb, &dname, &npage) {
+                        bail!("Hay una página {npage} abierta en Graphics Builder: cerrala y repetí.");
+                    }
+                    gb.m("PageOpen", &[Arg::Str(sname.clone()), Arg::Str(spage.clone())])
+                        .map_err(|e| anyhow!("No se pudo abrir la página {sname}/{spage}: {e:#}"))?;
+                    let r: Result<Value> = (|| {
+                        let (objs, truncated) = page_objects(gb, 20_000, true);
+                        if truncated {
+                            bail!("La página tiene más de 20000 objetos: no se clona.");
+                        }
+                        let mut edits = Vec::new();
+                        for o in &objs {
+                            let (Some(props), Some(an)) = (o["properties"].as_object(), o["an"].as_i64().filter(|a| *a > 0)) else { continue };
+                            let props: Vec<(String, String)> = props.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect();
+                            let ch = oneline_clone::changes(&props, &rules);
+                            if !ch.is_empty() {
+                                edits.push((an as i16, ch));
+                            }
+                        }
+                        let seen: usize = edits.iter().map(|(_, c)| c.len()).sum();
+                        if seen < planned && !allow_partial {
+                            bail!(
+                                "Graphics Builder ve {seen} cambios y el plan offline {planned}: hay genies que no puede editar (dentro de grupos). \
+                                 No se guardó nada. Desagrupalos en la página de origen o repetí con allow_partial=true (quedan con los valores \
+                                 de origen; ver verification.not_applied)."
+                            );
+                        }
+                        for (an, ch) in &edits {
+                            gb.m("PageSelectObject", &[Arg::I2(*an)])?;
+                            for c in ch {
+                                gb.m("LibraryObjectPutProperty", &[Arg::Str(c.property.clone()), Arg::Str(c.new.clone())])
+                                    .map_err(|e| anyhow!("AN {an}, {}: {e:#}. No se guardó nada.", c.property))?;
+                            }
+                        }
+                        gb.m("PageSaveAs", &[Arg::Str(dname.clone()), Arg::Str(npage.clone())])?;
+                        Ok(json!({"objects": objs.len(), "genies_edited": edits.len(), "properties_set": seen}))
+                    })();
+                    // Cierra la página nueva ya guardada, o la de origen sin guardar si algo falló.
+                    close_page(gb);
+                    let mut v = r?;
+                    v["warnings"] = warnings_json(gb);
+                    Ok(v)
+                })
+            })
+            .await;
+        let gbv = match r {
+            Ok(g) => g,
+            Err(e) => {
+                let m = err(e);
+                self.audit("oneline_clone", &detail, &format!("ERROR {m}"));
+                return Err(m);
+            }
+        };
+        let (src, rules, dall, pg) = (plan.source, plan.rules, dest_all, page.clone());
+        let verification = blocking(Duration::from_secs(120), move || Ok(clone_verify(&src, &rules, &dall, &pg))).await.map_err(err)?;
+        let ok = verification["ok"].as_bool().unwrap_or(false);
+        self.audit("oneline_clone", &detail, if ok { "OK" } else { "OK (verificación con observaciones)" });
+        v["applied"] = json!(true);
+        v["graphics_builder"] = gbv;
+        v["verification"] = verification;
+        v["next_step"] = json!(if ok {
+            "Compilar el proyecto y regenerar AdvOneLine.csv con la One-Line Configuration Utility (los números zOL nuevos no están en el csv)."
+        } else {
+            "La página se guardó pero la verificación encontró diferencias (verification): revisalas con po_gb_page_read / po_oneline_validate \
+             y corregí con po_gb_page_edit, o borrala con po_gb_page_delete."
+        });
         pretty(&v, 200_000)
     }
 }

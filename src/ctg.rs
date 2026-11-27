@@ -203,6 +203,26 @@ pub fn zol_refs(d: &[u8]) -> Vec<(String, String)> {
     out
 }
 
+/// Cadenas del archivo que contienen `needle` (sin distinguir mayúsculas ASCII), sin repetir, hasta `max`.
+pub fn strings_containing(d: &[u8], needle: &str, max: usize) -> Vec<String> {
+    let n = crate::text::encode(needle);
+    let mut out: Vec<String> = Vec::new();
+    if n.is_empty() {
+        return out;
+    }
+    let mut i = 0;
+    while out.len() < max {
+        let Some(p) = d[i..].windows(n.len()).position(|w| w.eq_ignore_ascii_case(&n)) else { break };
+        let at = i + p;
+        i = at + n.len();
+        let s = enclosing_string(d, at, i);
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 /// Cadena (con largo delante) que contiene los bytes `at..e`. Si no se encuentra el largo, la corrida imprimible
 /// alrededor (hasta 400 caracteres por lado).
 fn enclosing_string(d: &[u8], at: usize, e: usize) -> String {
@@ -377,5 +397,18 @@ mod tests {
         let tags: Vec<&str> = r.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(tags, ["zOL\\Bus3", "zOL\\Bus4", "zOL\\Bkr12"]);
         assert!(r[0].1.starts_with("PLS_Bkr_Color_Bkr("), "{}", r[0].1);
+    }
+
+    #[test]
+    fn cadenas_con_un_texto() {
+        let d = fake::page(&[
+            fake::genie("pls_ansi_cb_1", "Breaker_1", &[("Equip", "EstA.Q1")]),
+            fake::animation("EquipGetProperty(\"ESTA.Q1\", \"x\")"),
+            fake::animation("EquipGetProperty(\"ESTA.Q1\", \"x\")"),
+        ]);
+        let s = strings_containing(&d, "esta.", 10);
+        assert_eq!(s, ["EstA.Q1", "EquipGetProperty(\"ESTA.Q1\", \"x\")"]);
+        assert_eq!(strings_containing(&d, "esta.", 1).len(), 1);
+        assert!(strings_containing(&d, "", 10).is_empty());
     }
 }

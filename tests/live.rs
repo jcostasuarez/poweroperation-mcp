@@ -247,3 +247,48 @@ fn gb_genie_otro_proyecto() {
     let _ = std::fs::remove_dir_all(&work);
     c.finish();
 }
+
+/// po_oneline_clone contra Graphics Builder: copia la página de ejemplo PSO_Equipment/SingleLinesOverview_T300 a
+/// MCP_Demo como `MCP_OL_Clone` con números nuevos y equipos reasignados, verifica el .ctg guardado (que
+/// LibraryObjectPutProperty vuelva a expandir las expresiones y que PageSaveAs guarde en otro proyecto) y la borra.
+#[test]
+#[ignore = "necesita Graphics Builder; escribe la página MCP_OL_Clone en MCP_Demo y la borra"]
+fn oneline_clone() {
+    let work = temp_dir("live-olc");
+    let mut mcp = Mcp::start_live(
+        &work,
+        &[("POWEROP_PROJECT", "MCP_Demo".into()), ("POWEROP_TIMEOUT_SECS", "150".into()), ("POWEROP_ALLOW_WRITE", "1".into())],
+    );
+    let mut c = Checks::default();
+    let page = "MCP_OL_Clone";
+    let _ = mcp.call("po_gb_page_delete", json!({"page": page}));
+    let args = json!({"source_project": "PSO_Equipment", "source_page": "SingleLinesOverview_T300", "page": page,
+                      "renumber": "offset", "offset": 500, "replace": [{"from": "MA_T300_", "to": "MCP_T301_"}]});
+    let (e, t) = mcp.call("po_oneline_clone", args.clone());
+    show("oneline_clone (plan)", &t);
+    let plan = if e { json!({}) } else { json_of(&t) };
+    c.check("plan con cambios", plan["total_changes"].as_u64().unwrap_or(0) > 0 && plan["applied"] == false, &t);
+
+    let mut args = args;
+    args["apply"] = json!(true);
+    let (e, t) = mcp.call("po_oneline_clone", args);
+    show("oneline_clone (apply)", &t);
+    let j = if e { json!({}) } else { json_of(&t) };
+    let v = &j["verification"];
+    c.check("guardada y cada cambio del plan quedó en el .ctg", !e && v["not_applied"] == json!([]), &t);
+    c.check("sin textos de origen", v["leftovers"] == json!([]), &t);
+    c.check(
+        "las expresiones se volvieron a expandir (sin zOL viejos)",
+        v["findings"].as_array().is_some_and(|f| !f.iter().any(|x| x["rule"] == "StaleZolReference")),
+        &t,
+    );
+    let (e, t) = mcp.call("po_oneline_read", json!({"pages": [page]}));
+    c.check("po_oneline_read ve los números nuevos", !e && t.contains("Bkr502"), &t);
+    let (e, t) = mcp.call("po_gb_page_delete", json!({"page": page}));
+    c.check("page_delete", !e, &t);
+    let audit = std::fs::read_to_string(work.join("audit.log")).unwrap_or_default();
+    c.check("auditoría de oneline_clone", audit.contains("oneline_clone"), &audit);
+    drop(mcp);
+    let _ = std::fs::remove_dir_all(&work);
+    c.finish();
+}

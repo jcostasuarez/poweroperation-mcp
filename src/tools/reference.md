@@ -28,7 +28,7 @@ herramientas habilita u oculta). Si se llama a una oculta, no se ejecuta nada y 
 | GB | Graphics Builder registrado como servidor COM (no lo abre) | `po_gb_status/library/page_read/page_thumbnail/genie_read` |
 | STUDIO | `PowerSCADA.Common.dll` y PowerShell de 32 bits encontrados | (con ESCRITURA) `po_project_compile`, `po_studio_set_project` |
 | MODBUS | `POWEROP_MODBUS` configurado y puerto TCP abierto | `po_plc_read` |
-| ESCRITURA | `POWEROP_ALLOW_WRITE=1` | combinada con otro puente: `po_tag_write`, `po_alarm_ack` (CTAPI); `po_cicode_write`, `po_project_create`, `po_project_unregister`, `po_project_rows_add/update` (DISCO); `po_runtime_control` (PROCESOS); `po_gb_page_create/edit/delete`, `po_gb_genie_create/edit/delete` (GB); `po_project_compile` (STUDIO) |
+| ESCRITURA | `POWEROP_ALLOW_WRITE=1` | combinada con otro puente: `po_tag_write`, `po_alarm_ack` (CTAPI); `po_cicode_write`, `po_project_create`, `po_project_unregister`, `po_project_rows_add/update`, `po_oneline_clone` (DISCO; con `apply=true` usa Graphics Builder); `po_runtime_control` (PROCESOS); `po_gb_page_create/edit/delete`, `po_gb_genie_create/edit/delete` (GB); `po_project_compile` (STUDIO) |
 
 - CTAPI, ODBC y MODBUS se vuelven a sondear cada `POWEROP_PROBE_SECS` (30 s por defecto; 0 = nunca) y al llamar a
   una herramienta oculta por ellos. Cuando cambia la lista, el servidor manda `notifications/tools/list_changed`.
@@ -506,7 +506,7 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   pudo restaurar (p. ej. la página quedó abierta porque falló el guardado), queda un aviso.
 - Las páginas toman los cambios del genie al abrirse (genies vinculados): editar el genie actualiza las páginas.
 
-### Advanced One-Line (`po_oneline_read`, `po_oneline_validate`; offline, solo lectura)
+### Advanced One-Line (`po_oneline_read`, `po_oneline_validate`: offline, solo lectura; `po_oneline_clone`)
 
 - **Cómo está armado** (PO 2024, visto en PLS_Include y en `OneLineConfig.Business.dll`; **verificado** sobre la página
   de ejemplo `PSO_Equipment/SingleLinesOverview_T300`): cada objeto del unifilar es un genie de PLS_Include
@@ -541,7 +541,31 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
     que lo defina (o un `zOL\Bus<N>` que no usa nadie): restos de una copia.
   - Con `AdvOneLine.csv` en la carpeta del proyecto: `NotInCsv` (en páginas, no en el csv: regenerar con la utilidad) y
     `CsvOrphan`. **Sin verificar** dónde lo guarda la utilidad (se busca en la carpeta del proyecto).
-- Clonar páginas con renumeración (`po_oneline_clone`) no existe todavía (issue #1).
+- `po_oneline_clone` (escritura): página nueva a partir de otra, con números zOL nuevos.
+  - **Plan** (`apply=false`, por defecto; offline, no necesita Graphics Builder): lee la página de origen (del
+    proyecto, de un incluido o de `source_project`, p. ej. una página de ejemplo de PSO_Equipment) y devuelve los
+    mapas viejo → nuevo por espacio (`bkr`: BkrNum/BkrNum1/2; `bus`: BusbarNum y todo `*BusbarNum*`; `mtr`: MtrNum;
+    `src`: SrcNum/SimSrcNum), los cambios por genie, `manual_zol_refs` (tags zOL escritos a mano en expresiones: no se
+    renumeran) y `expected_findings` (lo que daría `po_oneline_validate` sobre la página nueva junto al resto del
+    proyecto, con los `from` de `replace` como `foreign`).
+  - Numeración: `next_free` (desde el mayor usado + 1 o desde `start`, saltando los usados en las páginas del
+    proyecto e incluidos y en AdvOneLine.csv), `offset` (error si alguno choca) o `keep`. El mismo número viejo va
+    al mismo nuevo dentro de un espacio: las conexiones interruptor → barra se mantienen. Sin `bus` en `spaces`, la
+    copia queda colgada de las mismas barras. 0 y vacío no se tocan; `AN` nunca se cambia.
+  - `replace` cambia texto en las demás propiedades (Equip, Active, DetailsFn, textos), sin distinguir mayúsculas y
+    en orden. Conviene que sea específico: en `SingleLinesOverview_T300`, `T300` → `T301` también renombra la función
+    `PLST300ShowDetail` del `DetailsFn` (visto en el plan; usar `MA_T300_` → `MA_T301_`). Revisar `changes`.
+  - **Aplicar** (`apply=true`): abre la página de origen en Graphics Builder (no tiene que estar abierta), cambia
+    las propiedades con `LibraryObjectPutProperty` y la guarda con otro nombre (`PageSaveAs`); la de origen no se
+    guarda. Si Graphics Builder ve menos cambios que el plan (genies dentro de grupos: el recorrido de objetos no
+    entra en grupos) no guarda nada, salvo `allow_partial=true`. Después lee el `.ctg` guardado y compara genie por
+    genie (`verification.not_applied`), busca los textos de `replace` que quedaron (`leftovers`) y valida la página
+    nueva (`findings`, incluye `StaleZolReference` si alguna expresión siguió apuntando a un zOL viejo). No reemplaza
+    páginas existentes.
+  - **Sin verificar en vivo**: que `LibraryObjectPutProperty` vuelva a expandir las expresiones del genie (si no,
+    `verification` lo muestra como `StaleZolReference`/`leftovers`), `PageSaveAs` a otro proyecto y la numeración de
+    transformadores (`XFR<n>` del csv no se cuenta como usado). El plan se probó sobre `SingleLinesOverview_T300`
+    (16 objetos, 44 cambios). Después: compilar y regenerar AdvOneLine.csv con la One-Line Configuration Utility.
 
 ## 6. PLC por Modbus TCP (solo lectura)
 
