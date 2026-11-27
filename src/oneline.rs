@@ -287,8 +287,9 @@ pub fn validate(items: &[Item], ctx: &Context) -> Vec<Finding> {
         }
     }
     // Fuente simulada de un transformador (SimSrcNum/SimSrcNum2) igual al SrcNum de una fuente: la utilidad le
-    // asigna otro número al guardar (FixTransformerInvalidIDs).
-    let sources: HashSet<&str> = items.iter().filter(|i| i.kind == Kind::Source).filter_map(|i| i.number()).collect();
+    // asigna otro número al guardar (FixTransformerInvalidIDs). Se compara el número, no el texto: `07` = `7`.
+    let sources: HashSet<u32> =
+        items.iter().filter(|i| i.kind == Kind::Source).filter_map(|i| i.number()?.parse().ok()).filter(|&n| n > 0).collect();
     for it in items.iter().filter(|i| i.kind == Kind::Transformer) {
         for k in ["SimSrcNum", "SimSrcNum2"] {
             match it.p(k) {
@@ -298,7 +299,7 @@ pub fn validate(items: &[Item], ctx: &Context) -> Vec<Finding> {
                         f.push(Finding::new("error", "InvalidId", format!("transformer con {k} = '{v}': tiene que ser un entero mayor que 0"), &[it]))
                     }
                 }
-                Some(v) if sources.contains(v) => f.push(Finding::new(
+                Some(v) if v.parse().is_ok_and(|n: u32| sources.contains(&n)) => f.push(Finding::new(
                     "error",
                     "TransformerSourceClash",
                     format!("transformer con {k} = {v}, el SrcNum de una fuente: la One-Line Configuration Utility le va a asignar otro número"),
@@ -548,6 +549,10 @@ mod tests {
         assert!(!f.iter().any(|x| x.rule.starts_with("Duplicate")), "dos transformadores con la misma fuente simulada: {f:?}");
         let f = validate(&[xfr.clone(), src, bus("1"), bus("2")], &Context::default());
         assert_eq!(f.iter().filter(|x| x.rule == "TransformerSourceClash").count(), 1, "{f:?}");
+        // Con ceros a la izquierda es el mismo número.
+        let src07 = item("p", "pls_gen_eq_1", &[("SrcNum", "07"), ("BusbarNum", "1"), ("Active", "1")]);
+        let f = validate(&[xfr.clone(), src07, bus("1"), bus("2")], &Context::default());
+        assert_eq!(f.iter().filter(|x| x.rule == "TransformerSourceClash").count(), 1, "07 = 7: {f:?}");
         let mal = item("p", "pls_gen_eq_1", &[("SimSrcNum", "8"), ("SimSrcNum2", "x"), ("SrcBusbarNum", "1"), ("DestBusbarNum", "2")]);
         assert!(validate(&[mal], &Context::default()).iter().any(|x| x.rule == "InvalidId" && x.message.contains("SimSrcNum2")));
         let csv = Context { csv: Some(parse_csv("Component,Condition,Bus1,Bus2\nXFR7,,1,2\n")), ..Default::default() };
