@@ -101,7 +101,8 @@ herramientas habilita u oculta). Si se llama a una oculta, no se ejecuta nada y 
   **(verificado el 2026-10-16 con `Planta_Liquidos`, creado con `parent_dir` en `Desktop\prueba`: Studio lo lista y,
   con el `PROJECT.CIT` que escribe `write_project_cit` (agregado por `po_studio_set_project`, la misma función que usa
   esta herramienta), muestra revisión y fecha y lo abre como activo tras reiniciar Studio. Sin `PROJECT.CIT` lo lista
-  sin revisión ni fecha. La llamada desde `po_project_create` en sí no se probó en vivo.)** **Nunca**
+  sin revisión ni fecha. Desde `po_project_create`: verificado el 2026-11-27, `PROJECT.CIT OK` con GUID nuevo, y
+  Graphics Builder lo lista y guarda páginas ahí después de reabrirlo.)** **Nunca**
   restaurar backups `.ctz` para crear proyectos. **(verificado: `MCP_Create_Test` abre en Studio y en Graphics Builder
   y compila)**
 - `po_project_unregister`: quita proyectos del registro marcando sus filas de `MASTER.DBF` como borradas (`*`, como
@@ -238,9 +239,28 @@ END
   `po_tag_write` acepta un tag (`tag` + `value`) o un lote (`writes: [{tag, value}]`, hasta 50): el usuario confirma
   la lista completa, cada tag se escribe y relee por separado, hay una línea de auditoría por tag y si uno falla
   se siguen los demás e informa cada resultado.
+- `po_tag_read` devuelve por tag `value`, `quality` y `timestamp` (hora local de la última actualización;
+  `value_timestamp` si el valor cambió en otro momento). Calidad (ayuda: "The Quality Item", QualityGetPart):
+  `GOOD`, `UNCERTAIN` o `BAD`, con el subestado si lo hay (`BAD/COMM_FAILURE`, `BAD/LAST_KNOWN_VALUE`,
+  `BAD/WAITING_FOR_INITIAL_DATA`, `UNCERTAIN/LAST_USABLE_VALUE`, `GOOD/LOCAL_OVERRIDE`...). `quality_detail` aparece
+  si hay algo más: `extended` (`COMM_DEV_BAD`, `COMM_IOSERVER_BAD`, `STALE`, `INVALID_TAG`, `NOT_REPLICATED`...),
+  `limit` (LOW/HIGH/CONSTANT), `override` (el valor es el forzado, no el de campo), `control_inhibit` (escribir al
+  campo está bloqueado), `datasource_error`. Un valor con calidad BAD **no es el valor real** del equipo: decirlo al
+  usuario antes de sacar conclusiones. Los tags referenciados por ítem (`Tag.V`, `Tag.Field.T`) dan siempre GOOD y
+  hora 0 (según la ayuda).
+  Varios tags se leen en **un solo pedido** (ctListNew/ctListRead: todos del mismo instante); un tag que la lista no
+  devuelve completo se relee solo (ctTagReadEx) para tener el error real. `details=true` agrega `units`,
+  `description`, `eng_low`, `eng_high` y `type` (ctTagGetProperty). Un CtApi.dll sin estas funciones da solo `value`.
+  Tag inexistente: ni ctTagReadEx ni la lista fallan (dan TRUE, valor vacío y `BAD` + `INVALID_TAG`); el MCP lo relee
+  con ctTagRead y muestra su error, `error Citect 424 "Tag not found"`, igual que antes. **(verificado** contra el
+  runtime de MCP_Demo el 2026-11-27: horas FILETIME en hora local con milisegundos, elementos numéricos de
+  ctListItem desde la primera lectura, 4 tags en una lista con un solo releído (el inexistente), `details` con
+  kW / rango 0–1000 / REAL**)**.
 - `po_tag_read` con `samples` (hasta 120) e `interval_secs`: lee los mismos tags N veces cada X s (hasta 300 s en
   total) y resume por tag los valores distintos, cantidad de cambios y la hora del primer cambio. Sirve para
-  verificar secuencias (p. ej. una transferencia) sin escribir nada.
+  verificar secuencias (p. ej. una transferencia) sin escribir nada. Cada muestra es una lectura por lista; si la
+  calidad no es GOOD el valor sale como `"0 [BAD/COMM_FAILURE]"` (perder la comunicación cuenta como cambio).
+  `po_tag_browse with_values=true` agrega `QUALITY` a cada fila.
 - Error Citect/Windows **233** justo después de un reinicio del cliente es transitorio: en lecturas el MCP cierra la
   conexión, espera 1 s y reintenta una vez; si persiste, el error dice "el cliente se está reiniciando". En
   `po_tag_write` solo se reintenta la conexión, nunca la escritura (verificá con `po_tag_read`). **(verificado con un
@@ -253,7 +273,10 @@ END
 - Cliente al arrancar: abre en la página de `[Page] Startup` del citect.ini (en PO, `PageMenu`) y puede mostrar un
   error de `PLS_StartAdvOneLine()` (causa no verificada). `[Client] AutoLoginMode` intenta entrar con el usuario de
   Windows y da "invalid username or password" si no existe en el proyecto. **El agente nunca escribe contraseñas**:
-  las carga el usuario en Studio.
+  las carga el usuario en Studio. Con `AutoLoginMode = 5` (credenciales guardadas; el valor que dejó el Wizard) el
+  cliente muestra "Log in to display client" y **Cancel cierra el cliente** (verificado el 2026-11-27, aunque la
+  ayuda dice que solo el modo 4 cierra): Runtime Manager relanza los servidores pero no el cliente, y CtAPI da 233
+  hasta que alguien entra.
 - `po_cicode_run`: ejecuta en el runtime; los argumentos de cadena van entre comillas:
   `TagRead("Feeder1\MMXU1\TotW")`. El resultado vuelve como texto. En modo solo lectura solo se permiten
   funciones de consulta.
@@ -272,7 +295,10 @@ END
 
 - STATE y las descripciones de estado llegan **traducidas al idioma del runtime** (p. ej. "ACTIVADO", "DESACT.",
   "ALTO"): no compararlas contra textos en inglés.
-- Errores: "error Citect N" = código de Cicode/CtAPI; "error Windows N" = sistema. Frecuentes (verificado):
+- Errores: "error Citect N" = código de Cicode/CtAPI, con su título en inglés de la tabla "Cicode and General
+  Errors" de la ayuda (243 códigos; 1–31 son errores del dispositivo de I/O); "error Windows N" = sistema. Según la
+  ayuda de CtAPI, un error Windows indica conexión perdida y uno Citect, un pedido inválido con la conexión sana.
+  Frecuentes (verificado):
   424 tag no encontrado, 274 argumento inválido, 292 función inexistente (o identificador inválido),
   Windows 233 sin conexión con el cliente del runtime (transitorio tras un reinicio del cliente).
 
@@ -309,6 +335,10 @@ END
   chequeo en las opciones de Studio). **El Wizard reescribe el citect.ini y puede volver a poner `Run=` en otro
   proyecto** (verificado): revisá `Run=` después. `po_tag_read` con `samples` y `po_tag_write` en lote, verificados
   con el runtime real.
+  En la página "Project Setup" (Local Engineering Environment) el Wizard **no lista todos los proyectos**: el
+  2026-11-27 MCP_Demo no aparecía (su compilación era del 14/10 y tenía páginas cambiadas después) y apareció tras
+  compilarlo con `po_project_compile`. Si el proyecto no está en la lista, compilarlo primero. Criterio exacto no
+  verificado (Transferencia_Ejemplo, compilado al día, tampoco aparecía).
 - `Shutdown()` por `po_cicode_run` devolvió 274 y no hizo nada **(verificado)**. Al recompilar el proyecto que corre,
   Runtime Manager **a veces** reinicia el runtime solo (todos los Citect32 con PID nuevo; visto el 2026-10-14). El
   2026-10-15 no lo hizo en tres compilaciones de `Transferencia_Demo` corriendo, con y sin Studio abierto (misma PID).
@@ -385,7 +415,8 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   6 WUXGA, 7 HD1080.
 - `ops`: `text`, `rectangle`, `ellipse`, `line` (coordenadas en píxeles de la página, origen arriba a la izquierda),
   `genie` / `symbol` (librería + elemento en x, y; el genie con sus `properties`), y sobre objetos existentes (por
-  `an`, el número de animación que da `po_gb_page_read`): `set_genie_properties`, `move`, `delete`.
+  `an`, el número de animación que da `po_gb_page_read`): `set_genie_properties`, `move`, `delete` y `group`
+  (`{op: "group", ans: [a, b, ...]}`: `PageSelectObject` + `PageSelectObjectAdd` + `PageGroupSelectedObjects`).
 - **Aspecto (`look`) y nivel (`level`)** en `po_gb_page_create`/`po_gb_page_edit`: `line_width` va de **1 a 32**
   (Graphics Builder da E_INVALIDARG con 0, verificado; el MCP lo rechaza fuera de rango). `gradient_colour` /
   `gradient_mode` (0 a 8) se guardan en la figura, pero **la miniatura de Graphics Builder no los muestra
@@ -412,11 +443,13 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   - `set_touch` (solo en `po_gb_page_edit`/`po_gb_genie_edit`): `{an, action: "down"|"up", command, log_message?,
     repeat_ms?}` cambia el comando de Input | Touch de un objeto ya colocado. Lee antes lo actual
     (`PropertiesInputTouchGet`) y conserva el mensaje de log y la repetición si no se indican; la respuesta trae
-    `before` y `after`. Si no puede leer, no escribe. **Sin verificar en Graphics Builder**: la firma de
-    `PropertiesInputTouchGet` (acción de entrada + comando, log y repetición de salida) y que la acción 0/1 sea la
-    misma que en el Put (que sí está verificado con `button`). El typelib lista `PropertiesInputTouchGetW`/`PutW`; el
-    MCP llama por nombre sin W (IDispatch), como el Put de `button`, que funciona. Verificar con `po_project_query`
-    sobre `pgtouch`/`pgbutton` después de guardar.
+    `before` y `after` (`after` es lo que Graphics Builder devuelve al releer después de escribir). Si no puede
+    leer, no escribe. **Verificado en Graphics Builder (2026-11-26, páginas de MCP_Demo con otro proyecto
+    seleccionado en GB; `tests\live.rs gb_write`)**: `PropertiesInputTouchGet(acción, comando, log, repetición)`
+    (acción de entrada, el resto de salida; por nombre sin W, como el Put) con 1 = down y 0 = up, igual que el Put.
+    En un `button` queda en `pgbutton` (`DOWN_CMD` = al presionar, `CMD` = al soltar, un solo `MSG_LOG`); en otros
+    objetos en `pgtouch` (`ACTION` `KEY_LBUTTON`, `DOWN_CMD`, `CMD`; el log del up quedó en `MSG_LOG`, el del down no se probó). La repetición con
+    down/up se lee 0 y no se guarda (`RPT_RATE` vacío): si se pide `repeat_ms` y no queda, la respuesta trae `note`.
   - `trend`: x, y, x2, y2, `pens` (1 a 8: `{expression: "<trend tag>", colour, off_colour?}`), `samples`,
     `pixels_per_sample` (1 a 32; por defecto 2 px y tantas muestras como entren en el ancho). Usa `DrawTrend` +
     `PropertiesTrendPutEx` (documentados en la ayuda de la automatización). Cada pluma se escala con ENG_ZERO/ENG_FULL
@@ -435,7 +468,8 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
 - **`PageDelete` de la automatización no sirve en PO 2024 (verificado):** devuelve E_FAIL (E_ABORT si la página está
   abierta), con `True` o `False`, pero antes marca borrada la fila de `pages.dbf` y deja el `.ctg`/`.ctF` en disco:
   la página desaparece de Graphics Builder sin borrarse. Por eso `replace` ya no la usa. `po_gb_page_delete` todavía la
-  usa, y **el 2026-10-16 borró bien dos páginas cerradas** (fila, `.ctg` y `.ctF`; Transferencia_Ejemplo y MCP_Demo).
+  usa, y **el 2026-10-16 borró bien dos páginas cerradas** (fila, `.ctg` y `.ctF`; Transferencia_Ejemplo y MCP_Demo),
+  y el 2026-11-26 otras dos (páginas recién guardadas por `po_oneline_clone` en MCP_Demo y cerradas).
   Si falla como arriba, el error lo explica; para recuperar la página, `po_gb_page_create` con `replace=true` y el
   mismo nombre, o copiar el respaldo como `<página>.ctg`.
 - `look.align` **(verificado el 2026-10-16)**: la justificación de Graphics Builder solo dice hacia dónde crece el
@@ -445,6 +479,13 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   izquierda, para que no agranden el recuadro hacia arriba o la izquierda.
 - En `po_gb_page_read`, `x2`/`y2` son la coordenada del extremo opuesto (no el tamaño). Los objetos `Genie`/`Symbol`
   traen `library_object` (proyecto, librería, elemento) y los genies sus propiedades.
+- **Grupos (verificado el 2026-11-27, `tests\live.rs gb_write`)**: un grupo tiene AN propio y clase `Group`;
+  `po_gb_page_read` entra en él (`PageSelectFirstObjectInGroup`/`NextObjectInGroup`; los anidados también,
+  verificado en `tests\live.rs oneline_clone_grupos`) y lo devuelve con `path` y `children`; sus objetos van a continuación con `group` = el `path` del grupo. Un genie
+  agrupado se edita por su AN (`set_genie_properties`, verificado). Los objetos ocultos (`visible_when`) se listan
+  igual. `visible_when` sobre un genie dentro de un grupo dio E_HANDLE (0x80070006); sobre el grupo y sobre un texto
+  funciona. En `SingleLinesOverview_T300` hay dos objetos sin AN ni clase que no son grupos (E_HANDLE al entrar):
+  salen con `note`.
 - Una página nueva o editada **no se ve en runtime hasta compilar** el proyecto.
 - Diálogos modales: Graphics Builder bloquea las llamadas COM mientras muestra uno. El MCP los cierra solo
   (No/OK/Cancelar) y los devuelve en `warnings`, salvo los avisos de actualización de versión
@@ -524,10 +565,15 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   dedujo de páginas reales. **Verificado** el 2026-11-27 en las 111 `.ctg` de una instalación de PO 2024 (Include,
   PLS_Include, PSO_Equipment, Library_Controls y proyectos de prueba): todas son contenedores válidos y se leen sus 1745 genies con
   propiedades, sin ninguno sin leer. Lo que no reconozca va en `unparsed_genies`: no se adivina.
-- El tipo se deduce de las propiedades (no hay lista oficial): `BkrNum1/2` → ats, `BkrNum` → breaker, `MtrNum` →
-  meter, `SrcNum` → source (o transformer si además tiene origen y destino), solo `BusbarNum` → busbar. **Sin
-  verificar**: transformadores y ATS (no hay ejemplos en PO 2024 de fábrica). El `an` es la propiedad `AN` del genie
-  (los de PLS la tienen), no el AN del objeto en Graphics Builder.
+- El tipo se deduce de las propiedades: `BkrNum1/2` → ats, `BkrNum` → breaker, `MtrNum` → meter, `SrcNum` →
+  source, `SimSrcNum` (o `SrcNum`) con origen y destino → transformer, solo `BusbarNum` → busbar. **Coincide con la
+  lista oficial (2026-11-26)**: la utilidad toma el tipo de cada genie de `PLS_Include\SupportedGenies.xml`
+  (librería/genie → PwrBreaker, PwrBusbar, PwrMeter, PwrSource, PwrTransformer, PwrATS, PwrMotor) y sus propiedades
+  de `GenieDefinitions.xml`. Transformador (`trans_nd/sd/ss_1/2` de `pls_gen_eq_1/2`): `SimSrcNum` (fuente
+  simulada), `SimSrcNum2`, `SrcBusbarNum`, `DestBusbarNum`; no tiene tag zOL propio (anima con `zOL\Bus<origen>` y
+  `zOL\Bus<destino>`) y en el csv es `XFR<SimSrcNum>`. ATS (`ats_nd`): `BkrNum1/2`, `SrcBusbarNum1/2`,
+  `DestBusbarNum`. Los motores de `pls_gen_eq` son barras y los `pls_ansi/iec_mot_*` interruptores. El `an` es la
+  propiedad `AN` del genie (los de PLS la tienen), no el AN del objeto en Graphics Builder.
 - Recorre el proyecto y sus incluidos salvo los de sistema y librerías (como la utilidad: System, Include,
   PLS_Include, PSO_Equipment, Library_*...). `pages` filtra por nombre (`*`/`?`).
 - `po_oneline_validate` (errores primero):
@@ -543,12 +589,16 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   - `StaleZolReference`: un `zOL\Bkr<N>`/`Mtr`/`Src` en las expresiones de la página sin ningún objeto de esa página
     que lo defina (o un `zOL\Bus<N>` que no usa nadie): restos de una copia.
   - Con `AdvOneLine.csv` en la carpeta del proyecto: `NotInCsv` (en páginas, no en el csv: regenerar con la utilidad) y
-    `CsvOrphan`. **Sin verificar** dónde lo guarda la utilidad (se busca en la carpeta del proyecto).
+    `CsvOrphan`. La utilidad lo guarda en la carpeta del proyecto (visto en `OneLineCSV.Save` de
+    `OneLineConfig.Business.dll`, 2026-11-26), que es donde lo busca el MCP.
+  - `TransformerSourceClash` (error): el `SimSrcNum`/`SimSrcNum2` de un transformador es el `SrcNum` de una fuente.
+    La utilidad lo "arregla" sola dándole otro número al transformador (`FixTransformerInvalidIDs`): mejor
+    corregirlo en la página. Los transformadores no entran en los `Duplicate*` (varios comparten fuente simulada).
 - `po_oneline_clone` (escritura): página nueva a partir de otra, con números zOL nuevos.
   - **Plan** (`apply=false`, por defecto; offline, no necesita Graphics Builder): lee la página de origen (del
     proyecto, de un incluido o de `source_project`, p. ej. una página de ejemplo de PSO_Equipment) y devuelve los
     mapas viejo → nuevo por espacio (`bkr`: BkrNum/BkrNum1/2; `bus`: BusbarNum y todo `*BusbarNum*`; `mtr`: MtrNum;
-    `src`: SrcNum/SimSrcNum), los cambios por genie, `manual_zol_refs` (tags zOL escritos a mano en expresiones: no se
+    `src`: SrcNum/SimSrcNum/SimSrcNum2 y `SRC`/`XFR` del csv: el mismo espacio), los cambios por genie, `manual_zol_refs` (tags zOL escritos a mano en expresiones: no se
     renumeran) y `expected_findings` (lo que daría `po_oneline_validate` sobre la página nueva junto al resto del
     proyecto, con los `from` de `replace` como `foreign`).
   - Numeración: `next_free` (desde el mayor usado + 1 o desde `start`, saltando los usados en las páginas del
@@ -560,15 +610,33 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
     `PLST300ShowDetail` del `DetailsFn` (visto en el plan; usar `MA_T300_` → `MA_T301_`). Revisar `changes`.
   - **Aplicar** (`apply=true`): abre la página de origen en Graphics Builder (no tiene que estar abierta), cambia
     las propiedades con `LibraryObjectPutProperty` y la guarda con otro nombre (`PageSaveAs`); la de origen no se
-    guarda. Si Graphics Builder ve menos cambios que el plan (genies dentro de grupos: el recorrido de objetos no
-    entra en grupos) no guarda nada, salvo `allow_partial=true`. Después lee el `.ctg` guardado y compara genie por
+    guarda. El recorrido entra en grupos (ver Grupos más arriba). Si Graphics Builder ve menos cambios que el plan no
+    guarda nada, salvo `allow_partial=true`. Después lee el `.ctg` guardado y compara genie por
     genie (`verification.not_applied`), busca los textos de `replace` que quedaron (`leftovers`) y valida la página
     nueva (`findings`, incluye `StaleZolReference` si alguna expresión siguió apuntando a un zOL viejo). No reemplaza
-    páginas existentes.
-  - **Sin verificar en vivo**: que `LibraryObjectPutProperty` vuelva a expandir las expresiones del genie (si no,
-    `verification` lo muestra como `StaleZolReference`/`leftovers`), `PageSaveAs` a otro proyecto y la numeración de
-    transformadores (`XFR<n>` del csv no se cuenta como usado). El plan se probó sobre `SingleLinesOverview_T300`
-    (16 objetos, 44 cambios). Después: compilar y regenerar AdvOneLine.csv con la One-Line Configuration Utility.
+    páginas existentes. `verification.ok` = guardada y sin errores que el plan no esperaba; `new_findings` = lo
+    que la validación encontró y no estaba en `expected_findings`; `applied_as_planned` = todos los cambios en el `.ctg`.
+  - El destino tiene que ver las librerías de los genies (incluir PLS_Include): si no, Graphics Builder los abre
+    como `DummyMarker` (genie sin resolver) y no se les pueden cambiar propiedades. El plan lo avisa
+    (`missing_libraries`) y al aplicar, si faltan cambios y hay `DummyMarker`, no guarda nada y lo explica.
+  - **Verificado en vivo (2026-11-26, `PSO_Equipment/SingleLinesOverview_T300` → página nueva de MCP_Demo, 16
+    objetos, 39 cambios)**: `LibraryObjectPutProperty` vuelve a expandir las expresiones del genie (las animaciones
+    del `.ctg` guardado usan los zOL nuevos, sin `StaleZolReference` ni `leftovers`); `PageSaveAs` guarda en el
+    proyecto de destino (`.ctg`/`.ctF` en su carpeta y fila en su `pages.dbf`; la de origen no cambia); Graphics
+    Builder vio los 39 cambios (esa página no tiene genies en grupos).
+  - **Verificado en vivo dentro del mismo proyecto (2026-11-27, `tests\live.rs oneline_clone_mismo_proyecto`)**: en
+    un proyecto creado con `po_project_create` que incluye PLS_Include y PSO_Equipment (`pls_easergy` está en
+    PSO_Equipment, no en PLS_Include), una copia de T300 clonada con `next_free` toma números por encima de los de la
+    página de origen; 18 genies y 39 propiedades editados, `ok`, y `po_oneline_validate` del proyecto sin errores
+    ni advertencias. Graphics Builder carga la lista de proyectos al abrir: con un proyecto creado después hay que
+    reabrirlo (el error lo dice). El plan (`apply=false`) también necesita `POWEROP_ALLOW_WRITE=1` (la herramienta
+    es de escritura).
+  - **Verificado en vivo con grupos (2026-11-27, `tests\live.rs oneline_clone_grupos`)**: en una copia de T300 con
+    dos interruptores en un grupo y ese grupo junto con una barra dentro de otro (interruptores a profundidad 2),
+    Graphics Builder vio y editó los 39 cambios del plan (18 genies), el `.ctg` guardado coincide con el plan
+    (`applied_as_planned`, sin `leftovers`), la copia conserva los dos grupos y `po_oneline_validate` del proyecto
+    queda sin errores ni advertencias. El lector offline del `.ctg` también ve los genies anidados.
+    Después: compilar y regenerar AdvOneLine.csv con la One-Line Configuration Utility.
 
 ## 6. PLC por Modbus TCP (solo lectura)
 

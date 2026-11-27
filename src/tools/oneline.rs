@@ -121,7 +121,7 @@ pub struct OneLineCloneParams {
     /// false (por defecto): solo devuelve el plan, sin Graphics Builder ni escrituras. true: crea la página.
     #[serde(default)]
     pub apply: Option<bool>,
-    /// Guardar aunque Graphics Builder vea menos cambios que el plan (genies dentro de grupos, que no puede editar):
+    /// Guardar aunque Graphics Builder vea menos cambios que el plan (genies que no encuentra o no puede editar):
     /// esos quedan con los números y textos de origen. Por defecto false: no se guarda nada.
     #[serde(default)]
     pub allow_partial: Option<bool>,
@@ -326,7 +326,19 @@ fn clone_plan(
     let dest_name = dest[0].name.clone();
     let expected = page_findings(&s, &dest_name, page, page_items(&dest_name, page, &simulated), &[], &ctx);
     let used_max: BTreeMap<&str, Option<u32>> = Space::ALL.iter().map(|sp| (sp.name(), used.get(sp).and_then(|s| s.iter().next_back().copied()))).collect();
+    // Librerías de genies que el proyecto destino no ve (ni él ni sus incluidos): Graphics Builder muestra esos genies
+    // como DummyMarker y no los puede editar (visto el 2026-11-26 con MCP_Demo, que no incluye PLS_Include).
+    let libs: std::collections::BTreeSet<String> = g.genies.iter().map(|x| x.library.to_lowercase()).collect();
+    let missing_libs: Vec<String> = libs.into_iter().filter(|l| super::graphics::library_project(dest, l, "ctm").is_none()).collect();
     let mut warnings: Vec<String> = Vec::new();
+    if !missing_libs.is_empty() {
+        warnings.push(format!(
+            "{} no ve las librerías {} (ni en sus incluidos, p. ej. falta PLS_Include): la página nueva se guarda, pero en ese proyecto \
+             Graphics Builder muestra esos genies como DummyMarker y no anda en runtime. Agregá el incluido antes de usarla.",
+            dest[0].name,
+            missing_libs.join(", ")
+        ));
+    }
     if !g.unparsed.is_empty() {
         warnings.push(format!(
             "{} genies de la página de origen no se pudieron leer offline ({}): el plan no los incluye y Graphics Builder puede cambiar \
@@ -351,14 +363,24 @@ fn clone_plan(
         "changes": changes,
         "non_numeric_numbers": odd,
         "manual_zol_refs": manual,
+        "missing_libraries": missing_libs,
         "expected_findings": expected,
         "warnings": warnings,
     });
     Ok(ClonePlan { source: g.genies, rules, planned, json })
 }
 
+/// Hallazgos de `found` que no estaban en `expected` (misma severidad, regla y mensaje).
+fn new_findings(found: &[Value], expected: &[Value]) -> Vec<Value> {
+    let key = |f: &Value| (f["severity"].as_str().unwrap_or_default().to_string(), f["rule"].as_str().unwrap_or_default().to_string(), f["message"].as_str().unwrap_or_default().to_string());
+    let known: HashSet<_> = expected.iter().map(key).collect();
+    found.iter().filter(|f| !known.contains(&key(f))).cloned().collect()
+}
+
 /// Después de guardar: compara el .ctg nuevo con el plan y valida la página nueva contra el resto del proyecto.
-fn clone_verify(plan_source: &[ctg::GenieInstance], rules: &Rules, dest: &[Project], page: &str) -> Value {
+/// `ok` = cada cambio quedó, no quedaron textos de origen y no hay errores que el plan no esperaba
+/// (`expected_findings`, p. ej. equipos que todavía no existen en el proyecto destino).
+fn clone_verify(plan_source: &[ctg::GenieInstance], rules: &Rules, dest: &[Project], page: &str, expected: &[Value]) -> Value {
     let Some(file) = project::find_file(&dest[0].path, &format!("{page}.ctg")) else {
         return json!({"ok": false, "error": format!("no se encontró {page}.ctg en {} después de guardar", dest[0].name)});
     };
@@ -385,13 +407,16 @@ fn clone_verify(plan_source: &[ctg::GenieInstance], rules: &Rules, dest: &[Proje
         equip_prefix: None,
     };
     let findings = page_findings(&s, &dest_name, page, page_items(&dest_name, page, &saved.genies), &ctg::zol_refs(&data), &ctx);
-    let errors = findings.iter().filter(|f| f["severity"] == "error").count();
-    let ok = not_applied.as_ref().is_ok_and(|v| v.is_empty()) && leftovers.is_empty() && errors == 0;
+    let unexpected = new_findings(&findings, expected);
+    let errors = unexpected.iter().filter(|f| f["severity"] == "error").count();
+    let applied = not_applied.as_ref().is_ok_and(|v| v.is_empty()) && leftovers.is_empty();
     json!({
-        "ok": ok,
+        "ok": applied && errors == 0,
+        "applied_as_planned": applied,
         "file": file.display().to_string(),
         "not_applied": match &not_applied { Ok(v) => json!(v), Err(e) => json!({"error": e}) },
         "leftovers": leftovers,
+        "new_findings": unexpected,
         "findings": findings,
         "unparsed_genies": saved.unparsed,
     })
@@ -578,8 +603,10 @@ impl PowerOpServer {
         }
 
         if !blocking(Duration::from_secs(10), || Ok(crate::gb::registered())).await.unwrap_or(false) {
-            return Err("apply=true necesita Graphics Builder (puente GB: Power Operation Studio instalado y registrado). El plan de arriba                         se puede armar sin él (apply=false)."
-                .into());
+            return Err(
+                "apply=true necesita Graphics Builder (puente GB: Power Operation Studio instalado y registrado). El plan se puede armar sin él (apply=false)."
+                    .into(),
+            );
         }
         let detail = format!("{}/{src_page} → {}/{page} ({} cambios en propiedades)", src_proj.name, dest.name, plan.planned);
         let (sname, dname, spage, npage) = (src_proj.name.clone(), dest.name.clone(), src_page.clone(), page.clone());
@@ -624,10 +651,18 @@ impl PowerOpServer {
                             }
                         }
                         let seen: usize = edits.iter().map(|(_, c)| c.len()).sum();
+                        let dummies = objs.iter().filter(|o| o["class"].as_str().is_some_and(|c| c.eq_ignore_ascii_case("DummyMarker"))).count();
+                        if seen < planned && dummies > 0 {
+                            bail!(
+                                "Graphics Builder ve {seen} cambios y el plan offline {planned}: muestra {dummies} genies como DummyMarker porque \
+                                 {sname} (con sus incluidos) no ve sus librerías (p. ej. falta PLS_Include; ver missing_libraries del plan). \
+                                 No se guardó nada. Agregá el incluido o cloná desde un proyecto que lo tenga."
+                            );
+                        }
                         if seen < planned && !allow_partial {
                             bail!(
-                                "Graphics Builder ve {seen} cambios y el plan offline {planned}: hay genies que no puede editar (dentro de grupos). \
-                                 No se guardó nada. Desagrupalos en la página de origen o repetí con allow_partial=true (quedan con los valores \
+                                "Graphics Builder ve {seen} cambios y el plan offline {planned}: hay genies que no encuentra o no puede editar. \
+                                 No se guardó nada. Revisá la página de origen con po_gb_page_read o repetí con allow_partial=true (quedan con los valores \
                                  de origen; ver verification.not_applied)."
                             );
                         }
@@ -658,7 +693,8 @@ impl PowerOpServer {
             }
         };
         let (src, rules, dall, pg) = (plan.source, plan.rules, dest_all, page.clone());
-        let verification = blocking(Duration::from_secs(120), move || Ok(clone_verify(&src, &rules, &dall, &pg))).await.map_err(err)?;
+        let expected = plan.json["expected_findings"].as_array().cloned().unwrap_or_default();
+        let verification = blocking(Duration::from_secs(120), move || Ok(clone_verify(&src, &rules, &dall, &pg, &expected))).await.map_err(err)?;
         let ok = verification["ok"].as_bool().unwrap_or(false);
         self.audit("oneline_clone", &detail, if ok { "OK" } else { "OK (verificación con observaciones)" });
         v["applied"] = json!(true);
@@ -671,5 +707,28 @@ impl PowerOpServer {
              y corregí con po_gb_page_edit, o borrala con po_gb_page_delete."
         });
         pretty(&v, 200_000)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hallazgos_nuevos_respecto_del_plan() {
+        let f = |sev: &str, rule: &str, msg: &str| json!({"severity": sev, "rule": rule, "message": msg, "at": []});
+        let expected = vec![f("error", "InvalidEquipment", "El equipo 'B_Q1' no existe")];
+        let found = vec![f("error", "InvalidEquipment", "El equipo 'B_Q1' no existe"), f("warning", "StaleZolReference", r"zOL\Bkr2 ...")];
+        let n = new_findings(&found, &expected);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0]["rule"], "StaleZolReference");
+        assert!(new_findings(&expected, &expected).is_empty());
+    }
+
+    #[test]
+    fn numero_de_un_tag_zol() {
+        assert_eq!(zol_number(r"zOL\Bkr502"), Some((Space::Bkr, 502)));
+        assert_eq!(zol_number(r"zOL\Bus3"), Some((Space::Bus, 3)));
+        assert_eq!(zol_number(r"zOL\Clr3"), None);
     }
 }

@@ -4,6 +4,7 @@ mod bridges;
 mod cicode;
 mod config;
 mod ctapi;
+mod cterrors;
 mod ctg;
 mod dbf;
 mod discover;

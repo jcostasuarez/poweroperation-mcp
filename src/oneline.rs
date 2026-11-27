@@ -12,7 +12,11 @@
 //! - Las validaciones replican las de la utilidad (`DuplicateBreaker`, `InvalidEquipment`, `NoLineActive`,
 //!   `SameSourceAndDestinationBus`, `InvalidSourceBus`...) más las de consistencia entre páginas.
 //!
-//! El tipo de cada genie se deduce de sus propiedades (no hay una lista oficial): ver `classify`.
+//! El tipo de cada genie se deduce de sus propiedades: ver `classify`. La utilidad usa dos archivos de PLS_Include:
+//! `SupportedGenies.xml` (librería/genie → tipo: PwrBreaker, PwrBusbar, PwrMeter, PwrSource, PwrTransformer, PwrATS,
+//! PwrMotor) y `GenieDefinitions.xml` (tipo → propiedades: ID, ID2, Node1..3). Las propiedades que usa `classify`
+//! coinciden con esas definiciones (transformador: SimSrcNum/SimSrcNum2 + SrcBusbarNum/DestBusbarNum; ATS:
+//! BkrNum1/2 + SrcBusbarNum1/2 + DestBusbarNum; los motores de pls_gen_eq_* son barras con BusbarNum).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -46,14 +50,15 @@ impl Kind {
         [Kind::Breaker, Kind::Ats, Kind::Busbar, Kind::Meter, Kind::Source, Kind::Transformer].into_iter().find(|k| k.name().eq_ignore_ascii_case(s.trim()))
     }
 
-    /// Prefijo del tag zOL y del componente de AdvOneLine.csv.
+    /// Prefijo del tag zOL y del componente de AdvOneLine.csv (vacío = no tiene). El transformador no tiene tag
+    /// zOL propio (sus genies solo animan `zOL\Bus<origen/destino>`); en el csv es `XFR<SimSrcNum>`.
     fn zol(self) -> Option<(&'static str, &'static str)> {
         match self {
             Kind::Breaker => Some(("Bkr", "BKR")),
             Kind::Busbar => Some(("Bus", "")),
             Kind::Meter => Some(("Mtr", "MTR")),
             Kind::Source => Some(("Src", "SRC")),
-            Kind::Transformer => Some(("Src", "XFR")),
+            Kind::Transformer => Some(("", "XFR")),
             Kind::Ats => None,
         }
     }
@@ -93,20 +98,21 @@ impl Item {
         self.genie.prop(k).map(str::trim).filter(|v| !v.is_empty())
     }
 
-    /// Número que identifica al objeto (BkrNum, BusbarNum, MtrNum, SrcNum).
+    /// Número que identifica al objeto (BkrNum, BusbarNum, MtrNum, SrcNum; SimSrcNum en transformadores).
     pub fn number(&self) -> Option<&str> {
         match self.kind {
             Kind::Breaker => self.p("BkrNum"),
             Kind::Busbar => self.p("BusbarNum"),
             Kind::Meter => self.p("MtrNum"),
-            Kind::Source | Kind::Transformer => self.p("SrcNum").or_else(|| self.p("SimSrcNum")),
+            Kind::Source => self.p("SrcNum").or_else(|| self.p("SimSrcNum")),
+            Kind::Transformer => self.p("SimSrcNum").or_else(|| self.p("SrcNum")),
             Kind::Ats => None,
         }
     }
 
     /// Tag zOL del objeto (`zOL\Bkr12`).
     pub fn zol_tag(&self) -> Option<String> {
-        let (t, _) = self.kind.zol()?;
+        let (t, _) = self.kind.zol().filter(|(t, _)| !t.is_empty())?;
         self.number().map(|n| format!("zOL\\{t}{n}"))
     }
 
@@ -274,7 +280,32 @@ pub fn validate(items: &[Item], ctx: &Context) -> Vec<Finding> {
             (_, Some(n)) if !is_number(n) => {
                 f.push(Finding::new("error", "InvalidId", format!("{} con {} = '{n}': tiene que ser un entero mayor que 0", it.kind.name(), id_prop(it.kind)), &[it]))
             }
+            // Varios transformadores pueden compartir la fuente simulada (la utilidad los renumera juntos): no
+            // es un repetido. Ver abajo el choque con fuentes.
+            (Kind::Transformer, Some(_)) => {}
             (k, Some(n)) => by_id.entry((k, n.to_string())).or_default().push(it),
+        }
+    }
+    // Fuente simulada de un transformador (SimSrcNum/SimSrcNum2) igual al SrcNum de una fuente: la utilidad le
+    // asigna otro número al guardar (FixTransformerInvalidIDs).
+    let sources: HashSet<&str> = items.iter().filter(|i| i.kind == Kind::Source).filter_map(|i| i.number()).collect();
+    for it in items.iter().filter(|i| i.kind == Kind::Transformer) {
+        for k in ["SimSrcNum", "SimSrcNum2"] {
+            match it.p(k) {
+                // SimSrcNum inválido ya salió arriba como InvalidId (es el número del transformador).
+                Some(v) if !is_number(v) => {
+                    if k == "SimSrcNum2" {
+                        f.push(Finding::new("error", "InvalidId", format!("transformer con {k} = '{v}': tiene que ser un entero mayor que 0"), &[it]))
+                    }
+                }
+                Some(v) if sources.contains(v) => f.push(Finding::new(
+                    "error",
+                    "TransformerSourceClash",
+                    format!("transformer con {k} = {v}, el SrcNum de una fuente: la One-Line Configuration Utility le va a asignar otro número"),
+                    &[it],
+                )),
+                _ => {}
+            }
         }
     }
     for ((kind, n), list) in &by_id {
@@ -458,7 +489,8 @@ fn id_prop(k: Kind) -> &'static str {
         Kind::Breaker => "BkrNum",
         Kind::Busbar => "BusbarNum",
         Kind::Meter => "MtrNum",
-        Kind::Source | Kind::Transformer => "SrcNum",
+        Kind::Source => "SrcNum",
+        Kind::Transformer => "SimSrcNum",
         Kind::Ats => "BkrNum1/BkrNum2",
     }
 }
@@ -494,6 +526,33 @@ mod tests {
         let g = GenieInstance { offset: 0, library: "CONTROLS".into(), genie: "x".into(), properties: vec![("Tag".into(), "A".into())] };
         assert_eq!(classify(&g), None);
         assert_eq!(item("p", "l", &[("bkrnum", "12")]).zol_tag().as_deref(), Some("zOL\\Bkr12"));
+    }
+
+    /// Propiedades reales de PLS_Include (pls_gen_eq_1.trans_nd_1 y ats_nd, leídas con po_gb_library el 2026-11-26).
+    #[test]
+    fn transformadores_y_ats_de_pls_include() {
+        let xfr = item("p", "pls_gen_eq_1", &[("SimSrcNum", "7"), ("SimSrcNum2", ""), ("SrcBusbarNum", "1"), ("DestBusbarNum", "2")]);
+        assert_eq!(xfr.kind, Kind::Transformer);
+        assert_eq!(xfr.number(), Some("7"));
+        assert_eq!(xfr.zol_tag(), None, "el transformador no anima un zOL\\Src propio");
+        let ats = item(
+            "p",
+            "pls_gen_eq_1",
+            &[("BkrNum1", "3"), ("SrcBusbarNum1", "1"), ("Txt3", ""), ("ClosedTag1", ""), ("BkrNum2", "4"), ("SrcBusbarNum2", "5"), ("DestBusbarNum", "2")],
+        );
+        assert_eq!(ats.kind, Kind::Ats);
+        let src = item("p", "pls_gen_eq_1", &[("SrcNum", "7"), ("BusbarNum", "1"), ("Active", "1")]);
+        let bus = |n| item("p", "pls_gen_eq_1", &[("BusbarNum", n)]);
+        let otro = item("q", "pls_gen_eq_1", &[("SimSrcNum", "7"), ("SrcBusbarNum", "5"), ("DestBusbarNum", "6")]);
+        let f = validate(&[xfr.clone(), otro, bus("1"), bus("2"), bus("5"), bus("6")], &Context::default());
+        assert!(!f.iter().any(|x| x.rule.starts_with("Duplicate")), "dos transformadores con la misma fuente simulada: {f:?}");
+        let f = validate(&[xfr.clone(), src, bus("1"), bus("2")], &Context::default());
+        assert_eq!(f.iter().filter(|x| x.rule == "TransformerSourceClash").count(), 1, "{f:?}");
+        let mal = item("p", "pls_gen_eq_1", &[("SimSrcNum", "8"), ("SimSrcNum2", "x"), ("SrcBusbarNum", "1"), ("DestBusbarNum", "2")]);
+        assert!(validate(&[mal], &Context::default()).iter().any(|x| x.rule == "InvalidId" && x.message.contains("SimSrcNum2")));
+        let csv = Context { csv: Some(parse_csv("Component,Condition,Bus1,Bus2\nXFR7,,1,2\n")), ..Default::default() };
+        let f = validate(&[xfr, bus("1"), bus("2")], &csv);
+        assert!(!f.iter().any(|x| x.rule == "NotInCsv" || x.rule == "CsvOrphan"), "{f:?}");
     }
 
     #[test]

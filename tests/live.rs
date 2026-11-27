@@ -36,6 +36,20 @@ fn verify_mcp_demo() {
     c.check("tag_read REAL", j[0]["value"].as_str().is_some_and(|v| v.trim().parse::<f64>().is_ok()), &t);
     c.check("tag_read INT", j[1]["value"] == "1" || j[1]["value"] == "2", &t);
     c.check("tag inexistente = error Citect 424", j[2]["error"].as_str().is_some_and(|e| e.contains("error Citect 424")), &t);
+    c.check("error Citect con título (\"Tag not found\")", j[2]["error"].as_str().is_some_and(|e| e.contains("Tag not found")), &t);
+    // Calidad y hora (lista con varios tags): hora de hoy, a menos de 10 min del reloj del equipo.
+    let recent = |v: &Value| {
+        v["timestamp"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .is_some_and(|d| (chrono::Utc::now().timestamp() - d.timestamp()).abs() < 600)
+    };
+    c.check("tag_read por lista: GOOD y hora reciente", j[0]["quality"] == "GOOD" && recent(&j[0]) && j[1]["quality"] == "GOOD", &t);
+    let (_, t) = mcp.call("po_tag_read", json!({"tags": ["Feeder1\\MMXU1\\TotW"], "details": true}));
+    show("tag_read un tag (ctTagReadEx) + details", &t);
+    let j = json_of(&t);
+    c.check("tag_read ctTagReadEx: GOOD y hora reciente", j[0]["quality"] == "GOOD" && recent(&j[0]), &t);
+    c.check("details: tipo REAL y rango", j[0]["type"] == "REAL" && j[0]["eng_high"].is_string(), &t);
 
     let (_, t) = mcp.call("po_tag_browse", json!({"filter": "TAG=Feeder1*", "with_values": true}));
     show("tag_browse", &t);
@@ -153,11 +167,14 @@ fn gb_write() {
                    {"op": "rectangle", "x": 30, "y": 100, "x2": 700, "y2": 400},
                    {"op": "genie", "library": "CONTROLS", "element": "Toggle_Button_1", "x": 80, "y": 160,
                     "properties": {"Tag": r"Feeder1\XCBR1\Trip", "Button_Text": "Disparo"}},
-                   {"op": "symbol", "library": "lights_round", "element": "green", "x": 400, "y": 170}
+                   {"op": "symbol", "library": "lights_round", "element": "green", "x": 400, "y": 170},
+                   {"op": "button", "x": 400, "y": 300, "x2": 560, "y2": 340, "text": "Touch", "command": "TraceMsg(\"down1\")", "up_command": "TraceMsg(\"up1\")"}
                ]}),
     );
     show("gb_page_create", &t);
     c.check("gb_page_create", !e && t.contains("\"page\": \"MCP_GB_Test\""), &t);
+    let rect_an = if e { None } else { json_of(&t)["ops"][1]["an"].as_i64() };
+    let button_an = if e { None } else { json_of(&t)["ops"][4]["an"].as_i64() };
 
     let (e, t) = mcp.call("po_gb_page_read", json!({"page": page}));
     show("gb_page_read", &t);
@@ -167,7 +184,8 @@ fn gb_write() {
     c.check("la página tiene el genie con sus propiedades", genie.as_ref().is_some_and(|g| g["properties"]["Tag"] == r"Feeder1\XCBR1\Trip"), &t);
     c.check("la página tiene el texto", objs.iter().any(|o| o["text"].as_str().is_some_and(|s| s.contains("creada por el MCP"))), &t);
 
-    if let Some(an) = genie.and_then(|g| g["an"].as_i64()) {
+    let genie_an = genie.and_then(|g| g["an"].as_i64());
+    if let Some(an) = genie_an {
         let (e, t) = mcp.call(
             "po_gb_page_edit",
             json!({"page": page, "ops": [
@@ -180,6 +198,45 @@ fn gb_write() {
         c.check("gb_page_edit guarda (con respaldo)", !e && t.contains("\"saved\": true") && t.contains("_mcp_backup"), &t);
         let (_, t) = mcp.call("po_gb_page_read", json!({"page": page}));
         c.check("la edición quedó guardada", t.contains("Editada por gb_page_edit") && t.contains("\"Button_Text\": \"Trip\""), &t);
+    }
+
+    // set_touch (#22): PropertiesInputTouchGet lee el comando de cada acción (1 = down, 0 = up) y `after` es lo
+    // releído; en pgbutton, DOWN_CMD = al presionar y CMD = al soltar. Verificado el 2026-11-26.
+    c.check("el button tiene AN", button_an.is_some(), "sin AN en la respuesta de gb_page_create");
+    if let Some(an) = button_an {
+        let (e, t) = mcp.call(
+            "po_gb_page_edit",
+            json!({"page": page, "ops": [
+                {"op": "set_touch", "an": an, "action": "down", "command": "TraceMsg(\"down2\")"},
+                {"op": "set_touch", "an": an, "action": "up", "command": "TraceMsg(\"up2\")", "log_message": "log up"}
+            ]}),
+        );
+        show("gb_page_edit set_touch", &t);
+        let j = if e { json!({}) } else { json_of(&t) };
+        c.check("set_touch lee el comando down anterior", j["ops"][0]["before"]["command"] == "TraceMsg(\"down1\")", &t);
+        c.check("set_touch lee el comando up anterior", j["ops"][1]["before"]["command"] == "TraceMsg(\"up1\")", &t);
+        c.check("set_touch relee lo escrito", j["ops"][0]["after"]["command"] == "TraceMsg(\"down2\")"
+            && j["ops"][1]["after"]["log_message"] == "log up", &t);
+        let (_, t) = mcp.call("po_project_query", json!({"table": "pgbutton", "where": {"PAGE": page, "AN": an.to_string()}}));
+        let row = json_of(&t)["rows"][0].clone();
+        c.check("pgbutton DOWN_CMD/CMD/MSG_LOG", row["DOWN_CMD"] == "TraceMsg(\"down2\")" && row["CMD"] == "TraceMsg(\"up2\")"
+            && row["MSG_LOG"] == "log up", &t);
+    }
+
+    // Grupos (#6): la op `group` agrupa por AN; po_gb_page_read entra en el grupo (PageSelectFirstObjectInGroup) y
+    // un genie agrupado se edita por su AN. Verificado el 2026-11-27.
+    if let (Some(r), Some(g)) = (rect_an, genie_an) {
+        let (e, t) = mcp.call("po_gb_page_edit", json!({"page": page, "ops": [{"op": "group", "ans": [r, g]}]}));
+        c.check("gb_page_edit group", !e && t.contains("\"grouped\": true"), &t);
+        let (e, t) = mcp.call("po_gb_page_edit", json!({"page": page, "ops": [
+            {"op": "set_genie_properties", "an": g, "properties": {"Button_Text": "Agrupado"}}]}));
+        c.check("set_genie_properties sobre un genie agrupado", !e && t.contains("\"saved\": true"), &t);
+        let (_, t) = mcp.call("po_gb_page_read", json!({"page": page}));
+        let objs = json_of(&t)["objects"].as_array().cloned().unwrap_or_default();
+        let group = objs.iter().find(|o| o["class"] == "Group" && o["children"] == 2).cloned();
+        let inner = objs.iter().find(|o| o["an"] == g).cloned().unwrap_or_default();
+        c.check("page_read ve el grupo y su genie", group.is_some_and(|gr| inner["group"] == gr["path"])
+            && inner["properties"]["Button_Text"] == "Agrupado", &t);
     }
 
     let r = mcp.rpc("tools/call", json!({"name": "po_gb_page_thumbnail", "arguments": {"page": page}}));
@@ -275,6 +332,7 @@ fn oneline_clone() {
     show("oneline_clone (apply)", &t);
     let j = if e { json!({}) } else { json_of(&t) };
     let v = &j["verification"];
+    println!("\n===== graphics_builder\n{:#}\n===== verification\n{:#}", j["graphics_builder"], v);
     c.check("guardada y cada cambio del plan quedó en el .ctg", !e && v["not_applied"] == json!([]), &t);
     c.check("sin textos de origen", v["leftovers"] == json!([]), &t);
     c.check(
@@ -282,12 +340,137 @@ fn oneline_clone() {
         v["findings"].as_array().is_some_and(|f| !f.iter().any(|x| x["rule"] == "StaleZolReference")),
         &t,
     );
+    c.check("verificación ok (sin errores que el plan no esperaba)", v["ok"] == true && v["applied_as_planned"] == true && v["new_findings"] == json!([]), &t);
+    c.check("guardada en la carpeta de MCP_Demo", v["file"].as_str().is_some_and(|f| f.contains("\\MCP_Demo\\")), &t);
+    let (e, t) = mcp.call("po_project_query", json!({"table": "pages", "where": {"NAME": page}}));
+    c.check("fila en pages.dbf de MCP_Demo", !e && json_of(&t)["matched"] == 1, &t);
     let (e, t) = mcp.call("po_oneline_read", json!({"pages": [page]}));
     c.check("po_oneline_read ve los números nuevos", !e && t.contains("Bkr502"), &t);
-    let (e, t) = mcp.call("po_gb_page_delete", json!({"page": page}));
-    c.check("page_delete", !e, &t);
+    // POWEROP_LIVE_KEEP=1 deja la página para revisarla en Graphics Builder (borrarla después con po_gb_page_delete).
+    if std::env::var("POWEROP_LIVE_KEEP").is_ok_and(|v| v == "1") {
+        println!("\n===== {page} queda en MCP_Demo (POWEROP_LIVE_KEEP=1)");
+    } else {
+        let (e, t) = mcp.call("po_gb_page_delete", json!({"page": page}));
+        show("gb_page_delete", &format!("{}{t}", if e { "[ERROR] " } else { "" }));
+        c.check("page_delete", !e, &t);
+    }
     let audit = std::fs::read_to_string(work.join("audit.log")).unwrap_or_default();
     c.check("auditoría de oneline_clone", audit.contains("oneline_clone"), &audit);
+    drop(mcp);
+    let _ = std::fs::remove_dir_all(&work);
+    c.finish();
+}
+/// po_oneline_clone dentro del mismo proyecto: `MCP_OL_Test` (creado con po_project_create, incluye PLS_Include y
+/// PSO_Equipment) tiene `MCP_OL_A` (copia de SingleLinesOverview_T300). Clona A como `MCP_OL_Tmp` con next_free,
+/// verifica que no repita números de A (po_oneline_validate sin errores) y la borra. Verificado el 2026-11-27.
+/// Graphics Builder tiene que haberse abierto después de crear el proyecto (carga la lista de proyectos al abrir).
+#[test]
+#[ignore = "necesita Graphics Builder y el proyecto MCP_OL_Test con la página MCP_OL_A; escribe MCP_OL_Tmp y la borra"]
+fn oneline_clone_mismo_proyecto() {
+    let work = temp_dir("live-olc2");
+    let mut mcp = Mcp::start_live(
+        &work,
+        &[("POWEROP_PROJECT", "MCP_OL_Test".into()), ("POWEROP_TIMEOUT_SECS", "150".into()), ("POWEROP_ALLOW_WRITE", "1".into())],
+    );
+    let mut c = Checks::default();
+    let page = "MCP_OL_Tmp";
+    let _ = mcp.call("po_gb_page_delete", json!({"page": page}));
+    let args = json!({"source_page": "MCP_OL_A", "page": page, "renumber": "next_free",
+                      "replace": [{"from": "MA_T300_", "to": "MCP_T303_"}]});
+    let (e, t) = mcp.call("po_oneline_clone", args.clone());
+    show("oneline_clone (plan)", &t);
+    let plan = if e { json!({}) } else { json_of(&t) };
+    c.check("plan con cambios y sin librerías faltantes", plan["total_changes"].as_u64().unwrap_or(0) > 0
+        && plan["missing_libraries"] == json!([]), &t);
+    let mut args = args;
+    args["apply"] = json!(true);
+    let (e, t) = mcp.call("po_oneline_clone", args);
+    show("oneline_clone (apply)", &t);
+    let j = if e { json!({}) } else { json_of(&t) };
+    let v = &j["verification"];
+    c.check("verificación ok", !e && v["ok"] == true && v["applied_as_planned"] == true && v["new_findings"] == json!([])
+        && v["leftovers"] == json!([]), &t);
+    let (e, t) = mcp.call("po_oneline_validate", json!({}));
+    c.check("sin errores ni advertencias en el proyecto (A y la copia no comparten números)",
+        !e && json_of(&t)["summary"]["errors"] == 0 && json_of(&t)["summary"]["warnings"] == 0, &t);
+    let (e, t) = mcp.call("po_gb_page_delete", json!({"page": page}));
+    c.check("page_delete", !e, &t);
+    drop(mcp);
+    let _ = std::fs::remove_dir_all(&work);
+    c.finish();
+}
+
+/// po_oneline_clone con genies del Advanced One-Line dentro de grupos (también anidados), en `MCP_OL_Test`: clona
+/// `MCP_OL_A` como `MCP_OL_G` (next_free), agrupa dos interruptores y mete ese grupo con una barra en otro grupo,
+/// clona `MCP_OL_G` como `MCP_OL_GC` y verifica que Graphics Builder editó los genies agrupados como dice el plan.
+/// Borra las dos páginas.
+#[test]
+#[ignore = "necesita Graphics Builder y el proyecto MCP_OL_Test con la página MCP_OL_A; escribe MCP_OL_G y MCP_OL_GC y las borra"]
+fn oneline_clone_grupos() {
+    let work = temp_dir("live-olc3");
+    let mut mcp = Mcp::start_live(
+        &work,
+        &[("POWEROP_PROJECT", "MCP_OL_Test".into()), ("POWEROP_TIMEOUT_SECS", "150".into()), ("POWEROP_ALLOW_WRITE", "1".into())],
+    );
+    let mut c = Checks::default();
+    let (pg, pc) = ("MCP_OL_G", "MCP_OL_GC");
+    for p in [pc, pg] {
+        let _ = mcp.call("po_gb_page_delete", json!({"page": p}));
+    }
+    let (e, t) = mcp.call("po_oneline_clone", json!({"source_page": "MCP_OL_A", "page": pg, "renumber": "next_free", "apply": true,
+                                                       "replace": [{"from": "MA_T300_", "to": "MCP_T304_"}]}));
+    c.check("copia MCP_OL_G", !e && json_of(&t)["verification"]["ok"] == true, &t);
+
+    let objs = |mcp: &mut Mcp, page: &str| -> Vec<Value> {
+        let (_, t) = mcp.call("po_gb_page_read", json!({"page": page}));
+        serde_json::from_str::<Value>(&t).ok().and_then(|j| j["objects"].as_array().cloned()).unwrap_or_default()
+    };
+    let has = |o: &Value, prop: &str| o["properties"][prop].as_str().is_some_and(|v| v.trim().parse::<u32>().is_ok_and(|n| n > 0));
+    let o = objs(&mut mcp, pg);
+    let bkrs: Vec<i64> = o.iter().filter(|o| has(o, "BkrNum")).filter_map(|o| o["an"].as_i64()).take(2).collect();
+    let bus = o.iter().find(|o| has(o, "BusbarNum") && !has(o, "BkrNum")).and_then(|o| o["an"].as_i64());
+    c.check("dos interruptores y una barra", bkrs.len() == 2 && bus.is_some(), &format!("{bkrs:?} {bus:?}"));
+    if bkrs.len() == 2 && let Some(bus) = bus {
+        let (e, t) = mcp.call("po_gb_page_edit", json!({"page": pg, "ops": [{"op": "group", "ans": bkrs}]}));
+        c.check("agrupa los interruptores", !e, &t);
+        let o = objs(&mut mcp, pg);
+        let inner = o.iter().find(|x| x["an"] == bkrs[0]).cloned().unwrap_or_default();
+        let g1 = o.iter().find(|x| x["class"] == "Group" && x["path"] == inner["group"]).and_then(|x| x["an"].as_i64());
+        c.check("el grupo tiene AN", g1.is_some(), &format!("{inner}"));
+        if let Some(g1) = g1 {
+            let (e, t) = mcp.call("po_gb_page_edit", json!({"page": pg, "ops": [{"op": "group", "ans": [g1, bus]}]}));
+            c.check("grupo anidado (grupo + barra)", !e, &t);
+        }
+        let o = objs(&mut mcp, pg);
+        let depth = |an: i64| o.iter().find(|x| x["an"] == an).and_then(|x| x["group"].as_array().map(|g| g.len())).unwrap_or(0);
+        println!("\n===== profundidad: bkr {} {}, bus {}", depth(bkrs[0]), depth(bkrs[1]), depth(bus));
+        c.check("interruptores a profundidad 2 y barra a 1", depth(bkrs[0]) == 2 && depth(bkrs[1]) == 2 && depth(bus) == 1, "");
+    }
+
+    let args = json!({"source_page": pg, "page": pc, "renumber": "next_free", "replace": [{"from": "MCP_T304_", "to": "MCP_T305_"}]});
+    let (e, t) = mcp.call("po_oneline_clone", args.clone());
+    show("oneline_clone grupos (plan)", &t);
+    let planned = if e { 0 } else { json_of(&t)["total_changes"].as_u64().unwrap_or(0) };
+    let mut args = args;
+    args["apply"] = json!(true);
+    let (e, t) = mcp.call("po_oneline_clone", args);
+    show("oneline_clone grupos (apply)", &t);
+    let j = if e { json!({}) } else { json_of(&t) };
+    let v = &j["verification"];
+    println!("\n===== graphics_builder\n{:#}\n===== verification\n{:#}", j["graphics_builder"], v);
+    c.check("Graphics Builder ve todos los cambios del plan", planned > 0 && j["graphics_builder"]["properties_set"].as_u64() == Some(planned), &t);
+    c.check("verificación ok", !e && v["ok"] == true && v["applied_as_planned"] == true && v["new_findings"] == json!([])
+        && v["leftovers"] == json!([]), &t);
+    let o = objs(&mut mcp, pc);
+    c.check("la copia conserva los grupos", o.iter().filter(|x| x["class"] == "Group" && x["path"].as_array().is_some()).count() >= 2, "");
+    let (e, t) = mcp.call("po_oneline_validate", json!({}));
+    c.check("sin errores ni advertencias en el proyecto", !e && json_of(&t)["summary"]["errors"] == 0 && json_of(&t)["summary"]["warnings"] == 0, &t);
+    if !std::env::var("POWEROP_LIVE_KEEP").is_ok_and(|v| v == "1") {
+        for p in [pc, pg] {
+            let (e, t) = mcp.call("po_gb_page_delete", json!({"page": p}));
+            c.check(&format!("borra {p}"), !e, &t);
+        }
+    }
     drop(mcp);
     let _ = std::fs::remove_dir_all(&work);
     c.finish();

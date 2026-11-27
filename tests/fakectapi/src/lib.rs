@@ -162,3 +162,136 @@ pub unsafe extern "system" fn ctGetProperty(obj: *mut c_void, name: *const c_cha
         None => 0,
     }
 }
+
+// ---- ctTagReadEx, ctTagGetProperty y listas (ctapi.h de 8.x) ----
+
+/// CT_TAGVALUE_ITEMS (pack 1, 38 bytes).
+#[repr(C, packed)]
+pub struct Items {
+    len: u32,
+    ts: u64,
+    vts: u64,
+    qts: u64,
+    general: u8,
+    sub: u8,
+    limit: u8,
+    ext: u8,
+    ds: u32,
+    ovr: u8,
+    ctl: u8,
+}
+
+/// Horas distintas según el camino, para que los tests sepan si se leyó por lista o por ctTagReadEx:
+/// 2026-11-27T10:00:00Z (ctTagReadEx) y 10:00:05Z (lista), como FILETIME.
+const FT_EX: u64 = (1_795_773_600 + 11_644_473_600) * 10_000_000;
+const FT_LIST: u64 = FT_EX + 50_000_000;
+
+/// Valor y calidad (general, substatus, extendido) de un tag conocido.
+fn reading(tag: &str) -> Option<(String, u8, u8, u8)> {
+    Some(match tag {
+        "Feeder1\\MMXU1\\TotW" => ("1234.5".into(), 3, 0, 0),
+        "Feeder1\\XCBR1\\Pos" => (POS.lock().unwrap().clone(), 3, 0, 0),
+        // Como un dispositivo sin comunicación: BAD/COMM_FAILURE, extendido COMM_DEV_BAD.
+        "Feeder2\\MMXU1\\TotW" => ("0".into(), 0, 6, 0x11),
+        _ => return None,
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ctTagReadEx(h: *mut c_void, tag: *const c_char, buf: *mut c_char, len: u32, items: *mut Items) -> i32 {
+    assert_eq!(h as usize, 0x1234);
+    // Como PO 2024 (visto el 2026-11-27): un tag inexistente no falla; da TRUE, valor vacío, BAD e INVALID_TAG, sin horas.
+    let (v, general, sub, ext) = reading(&unsafe { s(tag) }).unwrap_or_else(|| (String::new(), 0, 0, 2));
+    let ft = if ext == 2 { 0 } else { FT_EX };
+    if !items.is_null() {
+        let it = unsafe { &mut *items };
+        assert_eq!({ it.len }, 38, "dwLength debe ser sizeof(CT_TAGVALUE_ITEMS)");
+        *it = Items { len: 38, ts: ft, vts: ft, qts: ft, general, sub, limit: 0, ext, ds: 0, ovr: 0, ctl: 0 };
+    }
+    unsafe { put(buf, len, &v) as i32 }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ctTagGetProperty(_h: *mut c_void, tag: *const c_char, prop: *const c_char, data: *mut c_void, len: u32, ty: u32) -> i32 {
+    assert_eq!(ty, 129, "se piden como DBTYPE_STR");
+    let v = match (unsafe { s(tag) }.as_str(), unsafe { s(prop) }.as_str()) {
+        ("Feeder1\\MMXU1\\TotW", "Units") => "kW",
+        ("Feeder1\\MMXU1\\TotW", "Description") => "Potencia total",
+        ("Feeder1\\MMXU1\\TotW", "EngUnitsLow") => "0",
+        ("Feeder1\\MMXU1\\TotW", "EngUnitsHigh") => "1000",
+        ("Feeder1\\MMXU1\\TotW", "Type") => "5",
+        _ => {
+            unsafe { SetLastError(CT_ERR + 424) };
+            return 0;
+        }
+    };
+    unsafe { put(data as *mut c_char, len, v) as i32 }
+}
+
+struct ListTag { name: String, read: Option<(String, u8, u8, u8)> }
+struct List { tags: Vec<*mut ListTag> }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ctListNew(h: *mut c_void, _mode: u32) -> *mut c_void {
+    assert_eq!(h as usize, 0x1234);
+    Box::into_raw(Box::new(List { tags: vec![] })) as *mut c_void
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ctListAdd(l: *mut c_void, tag: *const c_char) -> *mut c_void {
+    let list = unsafe { &mut *(l as *mut List) };
+    let t = Box::into_raw(Box::new(ListTag { name: unsafe { s(tag) }, read: None }));
+    list.tags.push(t);
+    t as *mut c_void
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ctListRead(l: *mut c_void, ov: *mut c_void) -> i32 {
+    assert!(ov.is_null(), "lectura síncrona");
+    let list = unsafe { &mut *(l as *mut List) };
+    for &t in &list.tags {
+        let t = unsafe { &mut *t };
+        // Como PO 2024 (visto el 2026-11-27): un tag inexistente no hace fallar la lista; vuelve vacío, BAD y con
+        // extendido INVALID_TAG (0x02), sin horas.
+        t.read = Some(reading(&t.name).unwrap_or_else(|| (String::new(), 0, 0, 2)));
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ctListData(t: *mut c_void, buf: *mut c_void, len: u32, _mode: u32) -> i32 {
+    match &unsafe { &*(t as *const ListTag) }.read {
+        Some((v, ..)) => unsafe { put(buf as *mut c_char, len, v) as i32 },
+        None => {
+            unsafe { SetLastError(CT_ERR + 424) };
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ctListItem(t: *mut c_void, item: u32, buf: *mut c_void, len: u32, _mode: u32) -> i32 {
+    let Some((_, general, sub, ext)) = &unsafe { &*(t as *const ListTag) }.read else {
+        unsafe { SetLastError(CT_ERR + 424) };
+        return 0;
+    };
+    let v = match item {
+        2..=4 if *ext == 2 => String::new(),
+        2..=4 => FT_LIST.to_string(),
+        5 => general.to_string(),
+        6 => sub.to_string(),
+        8 => ext.to_string(),
+        7 | 9..=11 => "0".into(),
+        _ => panic!("ctListItem con elemento {item}"),
+    };
+    unsafe { put(buf as *mut c_char, len, &v) as i32 }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ctListFree(l: *mut c_void) -> i32 {
+    let list = unsafe { Box::from_raw(l as *mut List) };
+    for t in list.tags {
+        drop(unsafe { Box::from_raw(t) });
+    }
+    1
+}
