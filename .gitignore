@@ -29,3 +29,6 @@ desktop.ini
 
 # Notas locales del entorno de desarrollo (VM): no se publican
 AGENT.md
+
+# Second brain del repo (notas locales, por ahora fuera de los commits)
+/docs/
