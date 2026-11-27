@@ -518,9 +518,12 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   `AdvOneLine.exe` según `AdvOneLine.csv` (lo genera la One-Line Configuration Utility, `OneLineConfig.exe`:
   `Component,Condition,Bus1,Bus2` con `BKR<n>`, `SRC<n>`, `MTR<n>`, `XFR<n>` y colores `CLR<n>`).
 - Las herramientas leen los `.ctg` del disco **sin Graphics Builder**: ven genies ocultos y dentro de grupos, y las
-  expresiones ya expandidas. El formato `.ctg` no está documentado; el lector (`src/ctg.rs`) se probó contra ~1700
-  genies de las páginas de PLS_Include, PSO_Equipment, Library_Controls y MCP_Demo (todos leídos). Lo que no
-  reconozca va en `unparsed_genies`: no se adivina.
+  expresiones ya expandidas. El lector (`src/ctg.rs`) recorre el contenedor de la página (directorio → páginas →
+  objetos, sacado de `Ctg32.dll`) y lee solo los objetos de las páginas en uso: no toma los imports (librerías que
+  usa la página), ni páginas borradas ni huecos con restos. Lo que hay dentro de cada objeto no está documentado y se
+  dedujo de páginas reales. **Verificado** el 2026-11-27 en las 111 `.ctg` de una instalación de PO 2024 (Include,
+  PLS_Include, PSO_Equipment, Library_Controls y proyectos de prueba): todas son contenedores válidos y se leen sus 1745 genies con
+  propiedades, sin ninguno sin leer. Lo que no reconozca va en `unparsed_genies`: no se adivina.
 - El tipo se deduce de las propiedades (no hay lista oficial): `BkrNum1/2` → ats, `BkrNum` → breaker, `MtrNum` →
   meter, `SrcNum` → source (o transformer si además tiene origen y destino), solo `BusbarNum` → busbar. **Sin
   verificar**: transformadores y ATS (no hay ejemplos en PO 2024 de fábrica). El `an` es la propiedad `AN` del genie
