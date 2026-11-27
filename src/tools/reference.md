@@ -435,7 +435,8 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
 - **`PageDelete` de la automatización no sirve en PO 2024 (verificado):** devuelve E_FAIL (E_ABORT si la página está
   abierta), con `True` o `False`, pero antes marca borrada la fila de `pages.dbf` y deja el `.ctg`/`.ctF` en disco:
   la página desaparece de Graphics Builder sin borrarse. Por eso `replace` ya no la usa. `po_gb_page_delete` todavía la
-  usa, y **el 2026-10-16 borró bien dos páginas cerradas** (fila, `.ctg` y `.ctF`; Transferencia_Ejemplo y MCP_Demo).
+  usa, y **el 2026-10-16 borró bien dos páginas cerradas** (fila, `.ctg` y `.ctF`; Transferencia_Ejemplo y MCP_Demo),
+  y el 2026-11-26 otras dos (páginas recién guardadas por `po_oneline_clone` en MCP_Demo y cerradas).
   Si falla como arriba, el error lo explica; para recuperar la página, `po_gb_page_create` con `replace=true` y el
   mismo nombre, o copiar el respaldo como `<página>.ctg`.
 - `look.align` **(verificado el 2026-10-16)**: la justificación de Graphics Builder solo dice hacia dónde crece el
@@ -521,10 +522,15 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   expresiones ya expandidas. El formato `.ctg` no está documentado; el lector (`src/ctg.rs`) se probó contra ~1700
   genies de las páginas de PLS_Include, PSO_Equipment, Library_Controls y MCP_Demo (todos leídos). Lo que no
   reconozca va en `unparsed_genies`: no se adivina.
-- El tipo se deduce de las propiedades (no hay lista oficial): `BkrNum1/2` → ats, `BkrNum` → breaker, `MtrNum` →
-  meter, `SrcNum` → source (o transformer si además tiene origen y destino), solo `BusbarNum` → busbar. **Sin
-  verificar**: transformadores y ATS (no hay ejemplos en PO 2024 de fábrica). El `an` es la propiedad `AN` del genie
-  (los de PLS la tienen), no el AN del objeto en Graphics Builder.
+- El tipo se deduce de las propiedades: `BkrNum1/2` → ats, `BkrNum` → breaker, `MtrNum` → meter, `SrcNum` →
+  source, `SimSrcNum` (o `SrcNum`) con origen y destino → transformer, solo `BusbarNum` → busbar. **Coincide con la
+  lista oficial (2026-11-26)**: la utilidad toma el tipo de cada genie de `PLS_Include\SupportedGenies.xml`
+  (librería/genie → PwrBreaker, PwrBusbar, PwrMeter, PwrSource, PwrTransformer, PwrATS, PwrMotor) y sus propiedades
+  de `GenieDefinitions.xml`. Transformador (`trans_nd/sd/ss_1/2` de `pls_gen_eq_1/2`): `SimSrcNum` (fuente
+  simulada), `SimSrcNum2`, `SrcBusbarNum`, `DestBusbarNum`; no tiene tag zOL propio (anima con `zOL\Bus<origen>` y
+  `zOL\Bus<destino>`) y en el csv es `XFR<SimSrcNum>`. ATS (`ats_nd`): `BkrNum1/2`, `SrcBusbarNum1/2`,
+  `DestBusbarNum`. Los motores de `pls_gen_eq` son barras y los `pls_ansi/iec_mot_*` interruptores. El `an` es la
+  propiedad `AN` del genie (los de PLS la tienen), no el AN del objeto en Graphics Builder.
 - Recorre el proyecto y sus incluidos salvo los de sistema y librerías (como la utilidad: System, Include,
   PLS_Include, PSO_Equipment, Library_*...). `pages` filtra por nombre (`*`/`?`).
 - `po_oneline_validate` (errores primero):
@@ -540,12 +546,16 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   - `StaleZolReference`: un `zOL\Bkr<N>`/`Mtr`/`Src` en las expresiones de la página sin ningún objeto de esa página
     que lo defina (o un `zOL\Bus<N>` que no usa nadie): restos de una copia.
   - Con `AdvOneLine.csv` en la carpeta del proyecto: `NotInCsv` (en páginas, no en el csv: regenerar con la utilidad) y
-    `CsvOrphan`. **Sin verificar** dónde lo guarda la utilidad (se busca en la carpeta del proyecto).
+    `CsvOrphan`. La utilidad lo guarda en la carpeta del proyecto (visto en `OneLineCSV.Save` de
+    `OneLineConfig.Business.dll`, 2026-11-26), que es donde lo busca el MCP.
+  - `TransformerSourceClash` (error): el `SimSrcNum`/`SimSrcNum2` de un transformador es el `SrcNum` de una fuente.
+    La utilidad lo "arregla" sola dándole otro número al transformador (`FixTransformerInvalidIDs`): mejor
+    corregirlo en la página. Los transformadores no entran en los `Duplicate*` (varios comparten fuente simulada).
 - `po_oneline_clone` (escritura): página nueva a partir de otra, con números zOL nuevos.
   - **Plan** (`apply=false`, por defecto; offline, no necesita Graphics Builder): lee la página de origen (del
     proyecto, de un incluido o de `source_project`, p. ej. una página de ejemplo de PSO_Equipment) y devuelve los
     mapas viejo → nuevo por espacio (`bkr`: BkrNum/BkrNum1/2; `bus`: BusbarNum y todo `*BusbarNum*`; `mtr`: MtrNum;
-    `src`: SrcNum/SimSrcNum), los cambios por genie, `manual_zol_refs` (tags zOL escritos a mano en expresiones: no se
+    `src`: SrcNum/SimSrcNum/SimSrcNum2 y `SRC`/`XFR` del csv: el mismo espacio), los cambios por genie, `manual_zol_refs` (tags zOL escritos a mano en expresiones: no se
     renumeran) y `expected_findings` (lo que daría `po_oneline_validate` sobre la página nueva junto al resto del
     proyecto, con los `from` de `replace` como `foreign`).
   - Numeración: `next_free` (desde el mayor usado + 1 o desde `start`, saltando los usados en las páginas del
@@ -561,11 +571,18 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
     entra en grupos) no guarda nada, salvo `allow_partial=true`. Después lee el `.ctg` guardado y compara genie por
     genie (`verification.not_applied`), busca los textos de `replace` que quedaron (`leftovers`) y valida la página
     nueva (`findings`, incluye `StaleZolReference` si alguna expresión siguió apuntando a un zOL viejo). No reemplaza
-    páginas existentes.
-  - **Sin verificar en vivo**: que `LibraryObjectPutProperty` vuelva a expandir las expresiones del genie (si no,
-    `verification` lo muestra como `StaleZolReference`/`leftovers`), `PageSaveAs` a otro proyecto y la numeración de
-    transformadores (`XFR<n>` del csv no se cuenta como usado). El plan se probó sobre `SingleLinesOverview_T300`
-    (16 objetos, 44 cambios). Después: compilar y regenerar AdvOneLine.csv con la One-Line Configuration Utility.
+    páginas existentes. `verification.ok` = guardada y sin errores que el plan no esperaba; `new_findings` = lo
+    que la validación encontró y no estaba en `expected_findings`; `applied_as_planned` = todos los cambios en el `.ctg`.
+  - El destino tiene que ver las librerías de los genies (incluir PLS_Include): si no, Graphics Builder los abre
+    como `DummyMarker` (genie sin resolver) y no se les pueden cambiar propiedades. El plan lo avisa
+    (`missing_libraries`) y al aplicar, si faltan cambios y hay `DummyMarker`, no guarda nada y lo explica.
+  - **Verificado en vivo (2026-11-26, `PSO_Equipment/SingleLinesOverview_T300` → página nueva de MCP_Demo, 16
+    objetos, 39 cambios)**: `LibraryObjectPutProperty` vuelve a expandir las expresiones del genie (las animaciones
+    del `.ctg` guardado usan los zOL nuevos, sin `StaleZolReference` ni `leftovers`); `PageSaveAs` guarda en el
+    proyecto de destino (`.ctg`/`.ctF` en su carpeta y fila en su `pages.dbf`; la de origen no cambia); Graphics
+    Builder vio los 39 cambios (esa página no tiene genies en grupos). **Sin verificar**: aplicar un clon con genies
+    dentro de grupos, y un clon dentro del mismo proyecto (MCP_Demo no incluye PLS_Include: ver arriba).
+    Después: compilar y regenerar AdvOneLine.csv con la One-Line Configuration Utility.
 
 ## 6. PLC por Modbus TCP (solo lectura)
 

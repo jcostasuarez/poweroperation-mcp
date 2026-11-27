@@ -275,6 +275,7 @@ fn oneline_clone() {
     show("oneline_clone (apply)", &t);
     let j = if e { json!({}) } else { json_of(&t) };
     let v = &j["verification"];
+    println!("\n===== graphics_builder\n{:#}\n===== verification\n{:#}", j["graphics_builder"], v);
     c.check("guardada y cada cambio del plan quedó en el .ctg", !e && v["not_applied"] == json!([]), &t);
     c.check("sin textos de origen", v["leftovers"] == json!([]), &t);
     c.check(
@@ -282,10 +283,20 @@ fn oneline_clone() {
         v["findings"].as_array().is_some_and(|f| !f.iter().any(|x| x["rule"] == "StaleZolReference")),
         &t,
     );
+    c.check("verificación ok (sin errores que el plan no esperaba)", v["ok"] == true && v["applied_as_planned"] == true && v["new_findings"] == json!([]), &t);
+    c.check("guardada en la carpeta de MCP_Demo", v["file"].as_str().is_some_and(|f| f.contains("\\MCP_Demo\\")), &t);
+    let (e, t) = mcp.call("po_project_query", json!({"table": "pages", "where": {"NAME": page}}));
+    c.check("fila en pages.dbf de MCP_Demo", !e && json_of(&t)["matched"] == 1, &t);
     let (e, t) = mcp.call("po_oneline_read", json!({"pages": [page]}));
     c.check("po_oneline_read ve los números nuevos", !e && t.contains("Bkr502"), &t);
-    let (e, t) = mcp.call("po_gb_page_delete", json!({"page": page}));
-    c.check("page_delete", !e, &t);
+    // POWEROP_LIVE_KEEP=1 deja la página para revisarla en Graphics Builder (borrarla después con po_gb_page_delete).
+    if std::env::var("POWEROP_LIVE_KEEP").is_ok_and(|v| v == "1") {
+        println!("\n===== {page} queda en MCP_Demo (POWEROP_LIVE_KEEP=1)");
+    } else {
+        let (e, t) = mcp.call("po_gb_page_delete", json!({"page": page}));
+        show("gb_page_delete", &format!("{}{t}", if e { "[ERROR] " } else { "" }));
+        c.check("page_delete", !e, &t);
+    }
     let audit = std::fs::read_to_string(work.join("audit.log")).unwrap_or_default();
     c.check("auditoría de oneline_clone", audit.contains("oneline_clone"), &audit);
     drop(mcp);

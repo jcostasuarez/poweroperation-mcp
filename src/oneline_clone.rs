@@ -53,7 +53,9 @@ pub fn space_of(prop: &str) -> Option<Space> {
     match p.as_str() {
         "bkrnum" | "bkrnum1" | "bkrnum2" => Some(Space::Bkr),
         "mtrnum" => Some(Space::Mtr),
-        "srcnum" | "simsrcnum" => Some(Space::Src),
+        // SimSrcNum/SimSrcNum2: fuente simulada de un transformador, en el mismo espacio que SrcNum (la utilidad la
+        // renumbera si choca con una fuente: FixTransformerInvalidIDs de OneLineConfig.Business.dll).
+        "srcnum" | "simsrcnum" | "simsrcnum2" => Some(Space::Src),
         _ if p.contains("busbarnum") => Some(Space::Bus),
         _ => None,
     }
@@ -79,14 +81,15 @@ pub fn add_numbers(props: &[(String, String)], into: &mut Numbers) {
     }
 }
 
-/// Agrega los números de AdvOneLine.csv (`BKR12`, `SRC3`, `MTR4` y las barras Bus1/Bus2). `XFR<n>` no se cuenta:
-/// no se sabe en qué espacio numera la utilidad a los transformadores.
+/// Agrega los números de AdvOneLine.csv (`BKR12`, `SRC3`, `MTR4`, `XFR5` y las barras Bus1/Bus2). `XFR<n>` va al
+/// espacio `src`: n es el `SimSrcNum` del transformador (OneLineConfig.Business.dll arma el componente con
+/// "XFR" + el ID que GenieDefinitions.xml mapea a SimSrcNum).
 pub fn add_csv(rows: &[CsvRow], into: &mut Numbers) {
     for r in rows {
         let c = r.component.trim().to_ascii_uppercase();
         let sp = match c.get(..3) {
             Some("BKR") => Some(Space::Bkr),
-            Some("SRC") => Some(Space::Src),
+            Some("SRC") | Some("XFR") => Some(Space::Src),
             Some("MTR") => Some(Space::Mtr),
             _ => None,
         };
@@ -296,6 +299,7 @@ mod tests {
         assert_eq!(space_of("SrcBusbarNum1"), Some(Space::Bus));
         assert_eq!(space_of("DestBusbarNum"), Some(Space::Bus));
         assert_eq!(space_of("SimSrcNum"), Some(Space::Src));
+        assert_eq!(space_of("SimSrcNum2"), Some(Space::Src));
         assert_eq!(space_of("Equip"), None);
         assert_eq!(Space::parse("Busbar"), Some(Space::Bus));
     }
@@ -304,10 +308,14 @@ mod tests {
     fn numeros_de_genies_y_csv() {
         let mut n = Numbers::new();
         add_numbers(&props(&[("BkrNum", "12"), ("SrcBusbarNum", "3"), ("DestBusbarNum", "0"), ("Equip", "EstA.Q1")]), &mut n);
-        let csv = [CsvRow { component: "BKR40".into(), condition: "x".into(), bus1: "7".into(), bus2: "".into() }];
+        let csv = [
+            CsvRow { component: "BKR40".into(), condition: "x".into(), bus1: "7".into(), bus2: "".into() },
+            CsvRow { component: "XFR9".into(), condition: "".into(), bus1: "7".into(), bus2: "8".into() },
+        ];
         add_csv(&csv, &mut n);
         assert_eq!(n[&Space::Bkr], set(&[12, 40]));
-        assert_eq!(n[&Space::Bus], set(&[3, 7]));
+        assert_eq!(n[&Space::Bus], set(&[3, 7, 8]));
+        assert_eq!(n[&Space::Src], set(&[9]));
     }
 
     #[test]
