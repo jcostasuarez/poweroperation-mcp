@@ -2,13 +2,13 @@
 
 Servidor MCP (Rust + rmcp 3.5, stdio) para EcoStruxure Power Operation 2024 (AVEVA Plant SCADA 8.50 / Citect).
 Mismo stack y estilo que `..\ignition-mcp`. Se entrega como exe (`dist\poweroperation-mcp-<versión>.zip`).
-44 herramientas `po_*` (desde 0.3.0; antes sin prefijo): runtime por CtAPI (`src\tools\runtime.rs`), procesos y arranque del runtime (`src\tools\runadmin.rs`
+45 herramientas `po_*` (desde 0.3.0; antes sin prefijo): runtime por CtAPI (`src\tools\runtime.rs`), procesos y arranque del runtime (`src\tools\runadmin.rs`
 sobre `src\procs.rs`), proyecto offline por DBF/Cicode (`src\tools\project.rs`), escritura de tablas DBF
 (`src\tools\dbfwrite.rs` sobre `src\dbf.rs` y `src\ndx.rs`), creación de proyectos (`src\tools\projcreate.rs`),
 compilación (`src\tools\projadmin.rs`), proyecto activo de Studio (`src\tools\studio.rs`: UI Automation, citect.ini),
 Graphics Builder por COM (`src\tools\graphics.rs` sobre `src\gb.rs`), Advanced One-Line offline
-(`src\tools\oneline.rs` sobre `src\oneline.rs` y el lector de `.ctg` `src\ctg.rs`: formato deducido de páginas
-reales, ver su cabecera) y la referencia para el agente (`src\tools\reference.md`, embebida), PLC por Modbus TCP solo lectura (`src\tools\plc.rs`
+(`src\tools\oneline.rs` sobre `src\oneline.rs`, `src\oneline_clone.rs` (renumeración de `po_oneline_clone`) y el lector de `.ctg` `src\ctg.rs`: contenedor sacado de `Ctg32.dll`,
+contenido de los objetos deducido de páginas reales, ver su cabecera) y la referencia para el agente (`src\tools\reference.md`, embebida), PLC por Modbus TCP solo lectura (`src\tools\plc.rs`
 sobre `src\modbus.rs`) y `po_status` + sondeo de puentes (`src\tools\status.rs`). `src\argerr.rs` arma los errores
 de argumentos (campos válidos + esquema) desde `call_tool` en `src\server.rs`.
 
@@ -43,7 +43,7 @@ Release: `.\scripts\release.ps1` (x64 + x86, zip y SHA256 en `dist\`; con `-Publ
 
 - Escrituras (po_tag_write, po_alarm_ack, po_cicode_run con efectos, po_cicode_write, po_gb_page_create/edit/delete,
   po_gb_genie_create/edit/delete (solo librerías .ctm del propio proyecto, nunca de incluidos),
-  po_project_create, po_project_unregister, po_project_rows_add/update, po_project_compile, po_runtime_control, po_studio_set_project) siempre detrás de
+  po_project_create, po_project_unregister, po_project_rows_add/update, po_oneline_clone, po_project_compile, po_runtime_control, po_studio_set_project) siempre detrás de
   `POWEROP_ALLOW_WRITE=1` (sin él ni se listan) y auditadas. No escribir DBF salvo en `MCP_Demo` o en proyectos creados por el MCP (archivo
   `_mcp_created`), siempre con respaldo; respaldar `MASTER.DBF` antes de tocarlo. Cambiar `Run=` del citect.ini solo
   con respaldo fechado y OK del usuario. Nunca escribir contraseñas.

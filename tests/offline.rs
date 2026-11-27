@@ -145,7 +145,7 @@ fn offline_tools() {
         &t,
     );
     // Advanced One-Line offline: dos interruptores con el mismo BkrNum y equipos distintos (uno de otra estación),
-    // barras 1 y 2, y una animación que quedó apuntando a zOL\Bkr7 (resto de una copia).
+    // barras 1 y 2, y una animación que quedó apuntando a zOL\\Bkr7 (resto de una copia).
     common::write_dbf(&root.join("PO_Demo/equip.dbf"), &[("NAME", 40)], &[&["EstA.Q1"], &["EstA.Q2"]]);
     let page = oneline_page(&[
         lp_genie("pls_gen_base_1", "Busbar_H", &[("BusbarNum", "1")]),
@@ -262,6 +262,77 @@ fn offline_tools() {
 
     let (_, t) = mcp.call("po_reference", json!({}));
     c.check("reference", t.contains("TRNQUERY") && t.contains("CiAlarmObject"), &t.chars().take(200).collect::<String>());
+
+    drop(mcp);
+    let _ = std::fs::remove_dir_all(&work);
+    c.finish();
+}
+
+/// po_oneline_clone sin Graphics Builder: el plan (apply=false) renumera sin repetir los números usados en otras
+/// páginas, mantiene las conexiones, reemplaza la estación y anticipa lo que validaría la página nueva.
+#[test]
+fn oneline_clone_plan() {
+    let work = temp_dir("olclone");
+    let root = work.join("fakeuser");
+    fake_projects(&root);
+    common::write_dbf(&root.join("PO_Demo/equip.dbf"), &[("NAME", 40)], &[&["EstA.Q1"], &["EstA.Q2"], &["EstB.Q1"]]);
+    let origen = oneline_page(&[
+        lp_genie("pls_gen_base_1", "Busbar_H", &[("BusbarNum", "1")]),
+        lp_genie("pls_gen_base_1", "Busbar_H", &[("BusbarNum", "2")]),
+        lp_genie("pls_gen_base_1", "Busbar_H", &[("BusbarNum", "3")]),
+        lp_genie("pls_ansi_cb_1", "CB_Draw_1", &[("AN", "40"), ("BkrNum", "12"), ("Equip", "EstA.Q1"), ("SrcBusbarNum", "1"), ("DestBusbarNum", "2")]),
+        lp_genie("pls_ansi_cb_1", "CB_Draw_1", &[("AN", "41"), ("BkrNum", "13"), ("Equip", "EstA.Q2"), ("SrcBusbarNum", "2"), ("DestBusbarNum", "3")]),
+        lp_anim("PLS_Bkr_Color_Bkr(12, zOL\\Bus1, zOL\\Bus2, zOL\\Bkr12)"),
+        lp_anim("zOL\\Bkr99 = 1"),
+    ]);
+    std::fs::write(root.join("PO_Demo/EstA_Unifilar.ctg"), origen).unwrap();
+    let otra = oneline_page(&[lp_genie("pls_ansi_cb_1", "CB_Draw_1", &[("BkrNum", "20"), ("Equip", "EstA.Q1"), ("SrcBusbarNum", "1"), ("DestBusbarNum", "2")])]);
+    std::fs::write(root.join("PO_Demo/Otra.ctg"), otra).unwrap();
+    let mut mcp = Mcp::start(
+        &work,
+        &[
+            ("POWEROP_PROJECTS_DIR", root.display().to_string()),
+            ("POWEROP_PROJECT", "PO_Demo".into()),
+            ("POWEROP_CTAPI", root.join("no-existe").display().to_string()),
+            ("POWEROP_ALLOW_WRITE", "1".into()),
+        ],
+    );
+    let mut c = Checks::default();
+    c.check("po_oneline_clone se lista con escrituras", mcp.tool_names().iter().any(|t| t == "po_oneline_clone"), "");
+
+    let args = json!({"source_page": "EstA_Unifilar", "page": "EstB_Unifilar", "replace": [{"from": "esta.", "to": "EstB."}]});
+    let (e, t) = mcp.call("po_oneline_clone", args);
+    let j = if e { json!({}) } else { json_of(&t) };
+    let maps = &j["renumber"]["maps"];
+    c.check(
+        "plan: números nuevos desde el mayor usado + 1, barras con el mismo mapa",
+        !e && maps["bkr"] == json!({"12": 21, "13": 22}) && maps["bus"] == json!({"1": 4, "2": 5, "3": 6}) && j["renumber"]["used_max"]["bkr"] == 20,
+        &t,
+    );
+    let cb = j["changes"].as_array().and_then(|l| l.iter().find(|x| x["an"] == "40").cloned()).unwrap_or_default();
+    c.check(
+        "plan: cambios por genie (número, barras, equipo) y total",
+        j["total_changes"] == 11
+            && cb["changes"].as_array().is_some_and(|l| l.iter().any(|x| x["property"] == "SrcBusbarNum" && x["new"] == "4") && l.iter().any(|x| x["property"] == "Equip" && x["new"] == "EstB.Q1")),
+        &t,
+    );
+    c.check(
+        "plan: tag zOL escrito a mano, equipo nuevo inexistente, sin aplicar",
+        j["manual_zol_refs"].as_array().is_some_and(|l| l.len() == 1 && l[0]["tag"] == "zOL\\Bkr99")
+            && j["expected_findings"].as_array().is_some_and(|l| l.iter().any(|f| f["rule"] == "InvalidEquipment" && f["message"].as_str().unwrap_or("").contains("EstB.Q2")))
+            && !j["expected_findings"].as_array().is_some_and(|l| l.iter().any(|f| f["rule"].as_str().unwrap_or("").starts_with("Duplicate")))
+            && j["applied"] == false,
+        &t,
+    );
+
+    let (e, t) = mcp.call("po_oneline_clone", json!({"source_page": "EstA_Unifilar", "page": "EstB_Unifilar", "renumber": "offset", "offset": 8}));
+    c.check("offset que choca con un número usado: error", e && t.contains("[20]"), &t);
+    let (e, t) = mcp.call("po_oneline_clone", json!({"source_page": "EstA_Unifilar", "page": "Otra"}));
+    c.check("la página nueva no puede existir", e && t.contains("ya existe"), &t);
+    let (e, t) = mcp.call("po_oneline_clone", json!({"source_page": "EstA_Unifilar", "page": "X", "renumber": "keep", "start": 5}));
+    c.check("start solo con next_free", e && t.contains("next_free"), &t);
+    let (e, t) = mcp.call("po_oneline_clone", json!({"source_page": "NoHay", "page": "X"}));
+    c.check("página de origen inexistente", e && t.contains("No existe la página NoHay"), &t);
 
     drop(mcp);
     let _ = std::fs::remove_dir_all(&work);

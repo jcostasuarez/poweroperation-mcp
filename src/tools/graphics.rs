@@ -28,7 +28,7 @@ fn pretty(v: &Value, max: usize) -> ToolResult {
     Ok(truncate(&s, max))
 }
 
-fn check_writable(project: &str) -> Result<()> {
+pub(crate) fn check_writable(project: &str) -> Result<()> {
     if PROTECTED.iter().any(|p| p.eq_ignore_ascii_case(project)) {
         bail!("{project} es un proyecto de sistema o librería de Power Operation: el MCP no modifica sus páginas.");
     }
@@ -68,7 +68,7 @@ fn open_page(gb: &mut Session, project: &str, page: &str) -> Result<bool> {
 }
 
 /// Cierra la página activa sin guardar (si pregunta, el vigilante responde No).
-fn close_page(gb: &mut Session) {
+pub(crate) fn close_page(gb: &mut Session) {
     let _ = gb.m("PageClose", &[]);
 }
 
@@ -76,10 +76,16 @@ fn close_page(gb: &mut Session) {
 /// mismo nombre la sobrescribe sin preguntar y reescribe sus registros de animación (verificado en PO 2024).
 /// `PageDelete` no sirve: marca borrada la fila de pages.dbf y devuelve E_FAIL dejando el .ctg (verificado).
 fn close_if_open(gb: &mut Session, project: &str, page: &str) {
-    if gb.m("PageSelect", &[s(project), s(page)]).is_ok() && gb.m("PageName", &[]).is_ok_and(|r| r.ret.text().eq_ignore_ascii_case(page)) {
+    if is_open(gb, project, page) {
         close_page(gb);
     }
+}
+
+/// La página está abierta en Graphics Builder (queda seleccionada si lo está).
+pub(crate) fn is_open(gb: &mut Session, project: &str, page: &str) -> bool {
+    let open = gb.m("PageSelect", &[s(project), s(page)]).is_ok() && gb.m("PageName", &[]).is_ok_and(|r| r.ret.text().eq_ignore_ascii_case(page));
     gb.warnings.retain(|w| !w.starts_with("PageSelect"));
+    open
 }
 
 /// Apariencia de la página activa.
@@ -146,7 +152,7 @@ fn active_object(gb: &mut Session, with_props: bool) -> Value {
 }
 
 /// Recorre los objetos de la página activa (sin entrar en grupos).
-fn page_objects(gb: &mut Session, max: usize, with_props: bool) -> (Vec<Value>, bool) {
+pub(crate) fn page_objects(gb: &mut Session, max: usize, with_props: bool) -> (Vec<Value>, bool) {
     let mut objs = Vec::new();
     let mut seen = HashSet::new();
     let mut r = gb.m("PageSelectFirstObjectEx", &[]);
@@ -823,7 +829,7 @@ fn apply_level(gb: &mut Session, l: &LevelSpec) -> Result<()> {
 }
 
 /// Proyecto que tiene la librería `library` con la extensión dada, buscando en `projects` (en orden).
-fn library_project(projects: &[Project], library: &str, ext: &str) -> Option<String> {
+pub(crate) fn library_project(projects: &[Project], library: &str, ext: &str) -> Option<String> {
     projects.iter().find(|p| project::find_file(&p.path, &format!("{library}.{ext}")).is_some()).map(|p| p.name.clone())
 }
 
@@ -1038,7 +1044,7 @@ fn visible_projects(cat: &Catalog, selected: &str) -> Vec<String> {
 /// seleccionar el anterior. `ProjectSelect` es asíncrono (~200 ms), cambia también el proyecto activo de Studio
 /// (`LASTDATABASE` del citect.ini) y no hace nada si Graphics Builder tiene páginas abiertas: por eso `f` abre y
 /// cierra la página.
-fn with_project(gb: &mut Session, project: &str, cat: &Catalog, needs: &[String], f: impl FnOnce(&mut Session) -> Result<Value>) -> Result<Value> {
+pub(crate) fn with_project(gb: &mut Session, project: &str, cat: &Catalog, needs: &[String], f: impl FnOnce(&mut Session) -> Result<Value>) -> Result<Value> {
     let prev = gb.m("ProjectSelected", &[]).map(|r| r.ret.text()).unwrap_or_default();
     if prev.is_empty() || prev.eq_ignore_ascii_case(project) {
         return f(gb);
@@ -1270,7 +1276,7 @@ fn templates(gb: &mut Session, project: &str, style: &str) -> Vec<Value> {
     out
 }
 
-fn warnings_json(gb: &mut Session) -> Value {
+pub(crate) fn warnings_json(gb: &mut Session) -> Value {
     json!(std::mem::take(&mut gb.warnings))
 }
 

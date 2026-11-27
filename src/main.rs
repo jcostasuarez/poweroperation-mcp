@@ -9,6 +9,7 @@ mod dbf;
 mod discover;
 mod ndx;
 mod oneline;
+mod oneline_clone;
 mod gb;
 mod modbus;
 mod png;
