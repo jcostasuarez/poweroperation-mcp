@@ -385,7 +385,8 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   6 WUXGA, 7 HD1080.
 - `ops`: `text`, `rectangle`, `ellipse`, `line` (coordenadas en píxeles de la página, origen arriba a la izquierda),
   `genie` / `symbol` (librería + elemento en x, y; el genie con sus `properties`), y sobre objetos existentes (por
-  `an`, el número de animación que da `po_gb_page_read`): `set_genie_properties`, `move`, `delete`.
+  `an`, el número de animación que da `po_gb_page_read`): `set_genie_properties`, `move`, `delete` y `group`
+  (`{op: "group", ans: [a, b, ...]}`: `PageSelectObject` + `PageSelectObjectAdd` + `PageGroupSelectedObjects`).
 - **Aspecto (`look`) y nivel (`level`)** en `po_gb_page_create`/`po_gb_page_edit`: `line_width` va de **1 a 32**
   (Graphics Builder da E_INVALIDARG con 0, verificado; el MCP lo rechaza fuera de rango). `gradient_colour` /
   `gradient_mode` (0 a 8) se guardan en la figura, pero **la miniatura de Graphics Builder no los muestra
@@ -412,11 +413,13 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   - `set_touch` (solo en `po_gb_page_edit`/`po_gb_genie_edit`): `{an, action: "down"|"up", command, log_message?,
     repeat_ms?}` cambia el comando de Input | Touch de un objeto ya colocado. Lee antes lo actual
     (`PropertiesInputTouchGet`) y conserva el mensaje de log y la repetición si no se indican; la respuesta trae
-    `before` y `after`. Si no puede leer, no escribe. **Sin verificar en Graphics Builder**: la firma de
-    `PropertiesInputTouchGet` (acción de entrada + comando, log y repetición de salida) y que la acción 0/1 sea la
-    misma que en el Put (que sí está verificado con `button`). El typelib lista `PropertiesInputTouchGetW`/`PutW`; el
-    MCP llama por nombre sin W (IDispatch), como el Put de `button`, que funciona. Verificar con `po_project_query`
-    sobre `pgtouch`/`pgbutton` después de guardar.
+    `before` y `after` (`after` es lo que Graphics Builder devuelve al releer después de escribir). Si no puede
+    leer, no escribe. **Verificado en Graphics Builder (2026-11-26, páginas de MCP_Demo con otro proyecto
+    seleccionado en GB; `tests\live.rs gb_write`)**: `PropertiesInputTouchGet(acción, comando, log, repetición)`
+    (acción de entrada, el resto de salida; por nombre sin W, como el Put) con 1 = down y 0 = up, igual que el Put.
+    En un `button` queda en `pgbutton` (`DOWN_CMD` = al presionar, `CMD` = al soltar, un solo `MSG_LOG`); en otros
+    objetos en `pgtouch` (`ACTION` `KEY_LBUTTON`, `DOWN_CMD`, `CMD`; el log del up quedó en `MSG_LOG`, el del down no se probó). La repetición con
+    down/up se lee 0 y no se guarda (`RPT_RATE` vacío): si se pide `repeat_ms` y no queda, la respuesta trae `note`.
   - `trend`: x, y, x2, y2, `pens` (1 a 8: `{expression: "<trend tag>", colour, off_colour?}`), `samples`,
     `pixels_per_sample` (1 a 32; por defecto 2 px y tantas muestras como entren en el ancho). Usa `DrawTrend` +
     `PropertiesTrendPutEx` (documentados en la ayuda de la automatización). Cada pluma se escala con ENG_ZERO/ENG_FULL
@@ -446,6 +449,13 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
   izquierda, para que no agranden el recuadro hacia arriba o la izquierda.
 - En `po_gb_page_read`, `x2`/`y2` son la coordenada del extremo opuesto (no el tamaño). Los objetos `Genie`/`Symbol`
   traen `library_object` (proyecto, librería, elemento) y los genies sus propiedades.
+- **Grupos (verificado el 2026-11-27, `tests\live.rs gb_write`)**: un grupo tiene AN propio y clase `Group`;
+  `po_gb_page_read` entra en él (`PageSelectFirstObjectInGroup`/`NextObjectInGroup`; los anidados también, sin
+  probar) y lo devuelve con `path` y `children`; sus objetos van a continuación con `group` = el `path` del grupo. Un genie
+  agrupado se edita por su AN (`set_genie_properties`, verificado). Los objetos ocultos (`visible_when`) se listan
+  igual. `visible_when` sobre un genie dentro de un grupo dio E_HANDLE (0x80070006); sobre el grupo y sobre un texto
+  funciona. En `SingleLinesOverview_T300` hay dos objetos sin AN ni clase que no son grupos (E_HANDLE al entrar):
+  salen con `note`.
 - Una página nueva o editada **no se ve en runtime hasta compilar** el proyecto.
 - Diálogos modales: Graphics Builder bloquea las llamadas COM mientras muestra uno. El MCP los cierra solo
   (No/OK/Cancelar) y los devuelve en `warnings`, salvo los avisos de actualización de versión
@@ -567,8 +577,8 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
     `PLST300ShowDetail` del `DetailsFn` (visto en el plan; usar `MA_T300_` → `MA_T301_`). Revisar `changes`.
   - **Aplicar** (`apply=true`): abre la página de origen en Graphics Builder (no tiene que estar abierta), cambia
     las propiedades con `LibraryObjectPutProperty` y la guarda con otro nombre (`PageSaveAs`); la de origen no se
-    guarda. Si Graphics Builder ve menos cambios que el plan (genies dentro de grupos: el recorrido de objetos no
-    entra en grupos) no guarda nada, salvo `allow_partial=true`. Después lee el `.ctg` guardado y compara genie por
+    guarda. El recorrido entra en grupos (ver Grupos más arriba). Si Graphics Builder ve menos cambios que el plan no
+    guarda nada, salvo `allow_partial=true`. Después lee el `.ctg` guardado y compara genie por
     genie (`verification.not_applied`), busca los textos de `replace` que quedaron (`leftovers`) y valida la página
     nueva (`findings`, incluye `StaleZolReference` si alguna expresión siguió apuntando a un zOL viejo). No reemplaza
     páginas existentes. `verification.ok` = guardada y sin errores que el plan no esperaba; `new_findings` = lo
@@ -581,7 +591,8 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
     del `.ctg` guardado usan los zOL nuevos, sin `StaleZolReference` ni `leftovers`); `PageSaveAs` guarda en el
     proyecto de destino (`.ctg`/`.ctF` en su carpeta y fila en su `pages.dbf`; la de origen no cambia); Graphics
     Builder vio los 39 cambios (esa página no tiene genies en grupos). **Sin verificar**: aplicar un clon con genies
-    dentro de grupos, y un clon dentro del mismo proyecto (MCP_Demo no incluye PLS_Include: ver arriba).
+    dentro de grupos (el recorrido y la edición por AN de un genie agrupado sí están verificados) y un clon
+    dentro del mismo proyecto (MCP_Demo no incluye PLS_Include: ver arriba).
     Después: compilar y regenerar AdvOneLine.csv con la One-Line Configuration Utility.
 
 ## 6. PLC por Modbus TCP (solo lectura)

@@ -151,11 +151,40 @@ fn active_object(gb: &mut Session, with_props: bool) -> Value {
     Value::Object(o)
 }
 
-/// Recorre los objetos de la página activa (sin entrar en grupos).
+/// Selecciona el objeto de `path`: índice en el recorrido de la página (`PageSelectFirstObjectEx`/`NextObjectEx`,
+/// que no entra en grupos) y después, por cada nivel de grupo, índice dentro del grupo
+/// (`PageSelectFirstObjectInGroup`/`NextObjectInGroup`, documentados en la ayuda de la automatización).
+fn select_path(gb: &mut Session, path: &[usize]) -> Result<()> {
+    let Some((&top, inner)) = path.split_first() else { bail!("ruta vacía") };
+    gb.m("PageSelectFirstObjectEx", &[])?;
+    for _ in 0..top {
+        gb.m("PageSelectNextObjectEx", &[])?;
+    }
+    for &k in inner {
+        gb.m("PageSelectFirstObjectInGroup", &[])?;
+        for _ in 0..k {
+            gb.m("PageSelectNextObjectInGroup", &[])?;
+        }
+    }
+    Ok(())
+}
+
+/// Un grupo tiene AN propio y clase `Group` (verificado 2026-11-27 con la op `group`). También se prueban los
+/// objetos sin AN ni clase (en `SingleLinesOverview_T300` hay dos; no son grupos: E_HANDLE al entrar).
+fn maybe_group(o: &Value) -> bool {
+    let class = o["class"].as_str().unwrap_or_default();
+    class.eq_ignore_ascii_case("group") || (o["an"].is_null() && class.is_empty())
+}
+
+/// Recorre los objetos de la página activa, también los de dentro de grupos (a cualquier profundidad). Los grupos
+/// salen como `{class: "Group", path, children}` y sus objetos con `group: <path del grupo>`; `path` son los índices
+/// del recorrido (ver `select_path`).
 pub(crate) fn page_objects(gb: &mut Session, max: usize, with_props: bool) -> (Vec<Value>, bool) {
     let mut objs = Vec::new();
     let mut seen = HashSet::new();
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new(); // (índice en objs, ruta)
     let mut r = gb.m("PageSelectFirstObjectEx", &[]);
+    let mut i = 0;
     while r.is_ok() {
         if objs.len() >= max {
             return (objs, true);
@@ -167,8 +196,50 @@ pub(crate) fn page_objects(gb: &mut Session, max: usize, with_props: bool) -> (V
                 break;
             }
         }
+        if maybe_group(&obj) {
+            groups.push((objs.len(), vec![i]));
+        }
         objs.push(obj);
+        i += 1;
         r = gb.m("PageSelectNextObjectEx", &[]);
+    }
+    // Cada grupo se vuelve a seleccionar por su ruta (salir de un grupo deja el recorrido en otro lugar).
+    let mut k = 0;
+    while k < groups.len() {
+        let (gi, path) = groups[k].clone();
+        k += 1;
+        if let Err(e) = select_path(gb, &path).and_then(|_| gb.m("PageSelectFirstObjectInGroup", &[]).map(|_| ())) {
+            // No es un grupo (o no se pudo entrar): se deja dicho, sin AN ni clase no hay más que mostrar.
+            objs[gi]["note"] = json!(format!("Graphics Builder no da AN ni clase de este objeto y no se pudo recorrer como grupo: {e:#}"));
+            continue;
+        }
+        let mut children = 0;
+        let mut in_group = HashSet::new();
+        loop {
+            if objs.len() >= max {
+                return (objs, true);
+            }
+            let mut obj = active_object(gb, with_props);
+            if let Some(an) = obj["an"].as_i64() {
+                if an != 0 && !in_group.insert(an) {
+                    break;
+                }
+            }
+            if maybe_group(&obj) {
+                let mut p = path.clone();
+                p.push(children);
+                groups.push((objs.len(), p));
+            }
+            obj["group"] = json!(path);
+            objs.push(obj);
+            children += 1;
+            if children > 5000 || gb.m("PageSelectNextObjectInGroup", &[]).is_err() {
+                break;
+            }
+        }
+        objs[gi]["class"] = json!("Group");
+        objs[gi]["path"] = json!(path);
+        objs[gi]["children"] = json!(children);
     }
     (objs, false)
 }
@@ -425,7 +496,7 @@ pub enum PageOp {
         command: String,
         #[serde(default)]
         log_message: Option<String>,
-        /// Repetición en ms (por defecto la actual).
+        /// Repetición en ms (por defecto la actual). Con down/up Graphics Builder no la guarda (`after` dice lo guardado).
         #[serde(default)]
         repeat_ms: Option<i16>,
     },
@@ -433,6 +504,9 @@ pub enum PageOp {
     Move { an: i16, x: i16, y: i16 },
     /// Borra un objeto (por AN).
     Delete { an: i16 },
+    /// Agrupa objetos ya colocados (por AN, 2 o más): `PageSelectObject` + `PageSelectObjectAdd` +
+    /// `PageGroupSelectedObjects`. El grupo no tiene AN; `po_gb_page_read` lo muestra con sus objetos.
+    Group { ans: Vec<i16> },
 }
 
 impl PageOp {
@@ -451,6 +525,7 @@ impl PageOp {
             PageOp::SetTouch { .. } => "set_touch",
             PageOp::Move { .. } => "move",
             PageOp::Delete { .. } => "delete",
+            PageOp::Group { .. } => "group",
         }
     }
 }
@@ -622,6 +697,13 @@ fn check_op(op: &PageOp) -> Result<()> {
                 if *r < 1 {
                     bail!("repeat_ms = {r}: tiene que ser 1 o más (ms)");
                 }
+            }
+            (None, None, None)
+        }
+        PageOp::Group { ans } => {
+            let distinct: HashSet<_> = ans.iter().collect();
+            if ans.len() < 2 || distinct.len() != ans.len() {
+                bail!("ans: hacen falta 2 o más AN distintos");
             }
             (None, None, None)
         }
@@ -978,12 +1060,23 @@ fn apply_ops(gb: &mut Session, ops: &[PageOp], libs: &[Project]) -> Result<Vec<V
                     // Repetición mínima 1 ms (como en `button`): un 0 leído se escribe como 1.
                     let rep = repeat_ms.unwrap_or(old_rep).max(1);
                     gb.m("PropertiesInputTouchPut", &[Arg::I2(a), s(command), s(&log), Arg::I2(rep)])?;
-                    json!({
-                        "an": an,
-                        "action": action,
-                        "before": {"command": old_cmd, "log_message": old_log, "repeat_ms": old_rep},
-                        "after": {"command": command, "log_message": log, "repeat_ms": rep},
-                    })
+                    // `after` es lo que Graphics Builder devuelve después de escribir, no lo pedido: con Down/Up la
+                    // repetición se lee 0 y no se guarda (RPT_RATE vacío en pgbutton/pgtouch, verificado 2026-11-26).
+                    let after = match gb.m("PropertiesInputTouchGet", &[Arg::I2(a), Arg::OutStr, Arg::OutStr, Arg::OutI2]) {
+                        Ok(r) => json!({"command": r.outs[0].text(), "log_message": r.outs[1].text(),
+                                        "repeat_ms": r.outs[2].int().unwrap_or(0)}),
+                        Err(e) => json!({"command": command, "log_message": log, "repeat_ms": rep,
+                                         "unverified": format!("no se pudo releer: {e:#}")}),
+                    };
+                    let mut out = json!({"an": an, "action": action,
+                        "before": {"command": old_cmd, "log_message": old_log, "repeat_ms": old_rep}, "after": after});
+                    if after["command"].as_str().is_some_and(|c| c != command) {
+                        out["warning"] = json!("Graphics Builder devolvió otro comando después de escribir: revisar after.command");
+                    }
+                    if repeat_ms.is_some() && after["repeat_ms"].as_i64() != Some(rep as i64) {
+                        out["note"] = json!("repeat_ms no quedó guardado: con Down/Up Graphics Builder no guarda la repetición (ver after)");
+                    }
+                    out
                 }
                 PageOp::Move { an, x, y } => {
                     gb.m("PageSelectObject", &[Arg::I2(*an)])?;
@@ -994,6 +1087,14 @@ fn apply_ops(gb: &mut Session, ops: &[PageOp], libs: &[Project]) -> Result<Vec<V
                     gb.m("PageSelectObject", &[Arg::I2(*an)])?;
                     gb.m("PageDeleteObject", &[])?;
                     json!({"an": an, "deleted": true})
+                }
+                PageOp::Group { ans } => {
+                    gb.m("PageSelectObject", &[Arg::I2(ans[0])])?;
+                    for an in &ans[1..] {
+                        gb.m("PageSelectObjectAdd", &[Arg::I2(*an)])?;
+                    }
+                    gb.m("PageGroupSelectedObjects", &[])?;
+                    json!({"ans": ans, "grouped": true})
                 }
             })
         })();
@@ -1733,7 +1834,7 @@ impl PowerOpServer {
         }
     }
 
-    #[tool(name = "po_gb_page_edit", description = "Edita una página gráfica existente con Graphics Builder: lista de operaciones en orden (text con expression, rectangle/ellipse con fill, line, `look` (colores fijos, degradé, contorno, esquinas, fuente), `level` en rectangle, button con command/up_command/privilege, trend (plumas = trend tags), genie/symbol, set_genie_properties, set_dynamic (fill, visible_when, expression por AN), set_touch (comando Touch por AN, conserva log y repetición), move/delete por AN de po_gb_page_read) y guarda (copia previa del .ctg en _mcp_backup). Páginas de librerías de PO solo si están en POWEROP_GB_ALLOW_PAGES. Confirmá con el usuario. Requiere POWEROP_ALLOW_WRITE=1.")]
+    #[tool(name = "po_gb_page_edit", description = "Edita una página gráfica existente con Graphics Builder: lista de operaciones en orden (text con expression, rectangle/ellipse con fill, line, `look` (colores fijos, degradé, contorno, esquinas, fuente), `level` en rectangle, button con command/up_command/privilege, trend (plumas = trend tags), genie/symbol, set_genie_properties, set_dynamic (fill, visible_when, expression por AN), set_touch (comando Touch por AN, conserva log y repetición), move/delete por AN de po_gb_page_read, group (agrupar por AN)) y guarda (copia previa del .ctg en _mcp_backup). Páginas de librerías de PO solo si están en POWEROP_GB_ALLOW_PAGES. Confirmá con el usuario. Requiere POWEROP_ALLOW_WRITE=1.")]
     async fn gb_page_edit(&self, Parameters(p): Parameters<GbPageEditParams>) -> ToolResult {
         self.require_write("gb_page_edit").map_err(err)?;
         if p.ops.is_empty() {
@@ -2203,6 +2304,23 @@ mod tests {
             assert!(e.contains(campo) && e.contains("set_touch"), "{e}");
         }
         assert!(serde_json::from_value::<PageOp>(json!({"op": "set_touch", "an": 1, "action": "up", "command": "X()", "repeat": 5})).is_err());
+    }
+
+    #[test]
+    fn validate_group() {
+        assert!(validate_ops(&ops(json!([{"op": "group", "ans": [3, 4, 9]}]))).is_ok());
+        for bad in [json!({"op": "group", "ans": [3]}), json!({"op": "group", "ans": [3, 3]}), json!({"op": "group", "ans": []})] {
+            let e = validate_ops(&ops(json!([bad]))).unwrap_err().to_string();
+            assert!(e.contains("group") && e.contains("AN distintos"), "{e}");
+        }
+    }
+
+    #[test]
+    fn grupos_candidatos() {
+        assert!(maybe_group(&json!({"an": null, "class": ""})));
+        assert!(maybe_group(&json!({"an": 38, "class": "Group"})));
+        assert!(!maybe_group(&json!({"an": 12, "class": ""})));
+        assert!(!maybe_group(&json!({"an": null, "class": "Genie"})));
     }
 
     #[test]

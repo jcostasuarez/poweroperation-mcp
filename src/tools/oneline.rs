@@ -121,7 +121,7 @@ pub struct OneLineCloneParams {
     /// false (por defecto): solo devuelve el plan, sin Graphics Builder ni escrituras. true: crea la página.
     #[serde(default)]
     pub apply: Option<bool>,
-    /// Guardar aunque Graphics Builder vea menos cambios que el plan (genies dentro de grupos, que no puede editar):
+    /// Guardar aunque Graphics Builder vea menos cambios que el plan (genies que no encuentra o no puede editar):
     /// esos quedan con los números y textos de origen. Por defecto false: no se guarda nada.
     #[serde(default)]
     pub allow_partial: Option<bool>,
@@ -661,8 +661,8 @@ impl PowerOpServer {
                         }
                         if seen < planned && !allow_partial {
                             bail!(
-                                "Graphics Builder ve {seen} cambios y el plan offline {planned}: hay genies que no puede editar (dentro de grupos). \
-                                 No se guardó nada. Desagrupalos en la página de origen o repetí con allow_partial=true (quedan con los valores \
+                                "Graphics Builder ve {seen} cambios y el plan offline {planned}: hay genies que no encuentra o no puede editar. \
+                                 No se guardó nada. Revisá la página de origen con po_gb_page_read o repetí con allow_partial=true (quedan con los valores \
                                  de origen; ver verification.not_applied)."
                             );
                         }

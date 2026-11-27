@@ -153,11 +153,14 @@ fn gb_write() {
                    {"op": "rectangle", "x": 30, "y": 100, "x2": 700, "y2": 400},
                    {"op": "genie", "library": "CONTROLS", "element": "Toggle_Button_1", "x": 80, "y": 160,
                     "properties": {"Tag": r"Feeder1\XCBR1\Trip", "Button_Text": "Disparo"}},
-                   {"op": "symbol", "library": "lights_round", "element": "green", "x": 400, "y": 170}
+                   {"op": "symbol", "library": "lights_round", "element": "green", "x": 400, "y": 170},
+                   {"op": "button", "x": 400, "y": 300, "x2": 560, "y2": 340, "text": "Touch", "command": "TraceMsg(\"down1\")", "up_command": "TraceMsg(\"up1\")"}
                ]}),
     );
     show("gb_page_create", &t);
     c.check("gb_page_create", !e && t.contains("\"page\": \"MCP_GB_Test\""), &t);
+    let rect_an = if e { None } else { json_of(&t)["ops"][1]["an"].as_i64() };
+    let button_an = if e { None } else { json_of(&t)["ops"][4]["an"].as_i64() };
 
     let (e, t) = mcp.call("po_gb_page_read", json!({"page": page}));
     show("gb_page_read", &t);
@@ -167,7 +170,8 @@ fn gb_write() {
     c.check("la página tiene el genie con sus propiedades", genie.as_ref().is_some_and(|g| g["properties"]["Tag"] == r"Feeder1\XCBR1\Trip"), &t);
     c.check("la página tiene el texto", objs.iter().any(|o| o["text"].as_str().is_some_and(|s| s.contains("creada por el MCP"))), &t);
 
-    if let Some(an) = genie.and_then(|g| g["an"].as_i64()) {
+    let genie_an = genie.and_then(|g| g["an"].as_i64());
+    if let Some(an) = genie_an {
         let (e, t) = mcp.call(
             "po_gb_page_edit",
             json!({"page": page, "ops": [
@@ -180,6 +184,45 @@ fn gb_write() {
         c.check("gb_page_edit guarda (con respaldo)", !e && t.contains("\"saved\": true") && t.contains("_mcp_backup"), &t);
         let (_, t) = mcp.call("po_gb_page_read", json!({"page": page}));
         c.check("la edición quedó guardada", t.contains("Editada por gb_page_edit") && t.contains("\"Button_Text\": \"Trip\""), &t);
+    }
+
+    // set_touch (#22): PropertiesInputTouchGet lee el comando de cada acción (1 = down, 0 = up) y `after` es lo
+    // releído; en pgbutton, DOWN_CMD = al presionar y CMD = al soltar. Verificado el 2026-11-26.
+    c.check("el button tiene AN", button_an.is_some(), "sin AN en la respuesta de gb_page_create");
+    if let Some(an) = button_an {
+        let (e, t) = mcp.call(
+            "po_gb_page_edit",
+            json!({"page": page, "ops": [
+                {"op": "set_touch", "an": an, "action": "down", "command": "TraceMsg(\"down2\")"},
+                {"op": "set_touch", "an": an, "action": "up", "command": "TraceMsg(\"up2\")", "log_message": "log up"}
+            ]}),
+        );
+        show("gb_page_edit set_touch", &t);
+        let j = if e { json!({}) } else { json_of(&t) };
+        c.check("set_touch lee el comando down anterior", j["ops"][0]["before"]["command"] == "TraceMsg(\"down1\")", &t);
+        c.check("set_touch lee el comando up anterior", j["ops"][1]["before"]["command"] == "TraceMsg(\"up1\")", &t);
+        c.check("set_touch relee lo escrito", j["ops"][0]["after"]["command"] == "TraceMsg(\"down2\")"
+            && j["ops"][1]["after"]["log_message"] == "log up", &t);
+        let (_, t) = mcp.call("po_project_query", json!({"table": "pgbutton", "where": {"PAGE": page, "AN": an.to_string()}}));
+        let row = json_of(&t)["rows"][0].clone();
+        c.check("pgbutton DOWN_CMD/CMD/MSG_LOG", row["DOWN_CMD"] == "TraceMsg(\"down2\")" && row["CMD"] == "TraceMsg(\"up2\")"
+            && row["MSG_LOG"] == "log up", &t);
+    }
+
+    // Grupos (#6): la op `group` agrupa por AN; po_gb_page_read entra en el grupo (PageSelectFirstObjectInGroup) y
+    // un genie agrupado se edita por su AN. Verificado el 2026-11-27.
+    if let (Some(r), Some(g)) = (rect_an, genie_an) {
+        let (e, t) = mcp.call("po_gb_page_edit", json!({"page": page, "ops": [{"op": "group", "ans": [r, g]}]}));
+        c.check("gb_page_edit group", !e && t.contains("\"grouped\": true"), &t);
+        let (e, t) = mcp.call("po_gb_page_edit", json!({"page": page, "ops": [
+            {"op": "set_genie_properties", "an": g, "properties": {"Button_Text": "Agrupado"}}]}));
+        c.check("set_genie_properties sobre un genie agrupado", !e && t.contains("\"saved\": true"), &t);
+        let (_, t) = mcp.call("po_gb_page_read", json!({"page": page}));
+        let objs = json_of(&t)["objects"].as_array().cloned().unwrap_or_default();
+        let group = objs.iter().find(|o| o["class"] == "Group" && o["children"] == 2).cloned();
+        let inner = objs.iter().find(|o| o["an"] == g).cloned().unwrap_or_default();
+        c.check("page_read ve el grupo y su genie", group.is_some_and(|gr| inner["group"] == gr["path"])
+            && inner["properties"]["Button_Text"] == "Agrupado", &t);
     }
 
     let r = mcp.rpc("tools/call", json!({"name": "po_gb_page_thumbnail", "arguments": {"page": page}}));
