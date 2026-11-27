@@ -101,7 +101,8 @@ herramientas habilita u oculta). Si se llama a una oculta, no se ejecuta nada y 
   **(verificado el 2026-10-16 con `Planta_Liquidos`, creado con `parent_dir` en `Desktop\prueba`: Studio lo lista y,
   con el `PROJECT.CIT` que escribe `write_project_cit` (agregado por `po_studio_set_project`, la misma función que usa
   esta herramienta), muestra revisión y fecha y lo abre como activo tras reiniciar Studio. Sin `PROJECT.CIT` lo lista
-  sin revisión ni fecha. La llamada desde `po_project_create` en sí no se probó en vivo.)** **Nunca**
+  sin revisión ni fecha. Desde `po_project_create`: verificado el 2026-11-27, `PROJECT.CIT OK` con GUID nuevo, y
+  Graphics Builder lo lista y guarda páginas ahí después de reabrirlo.)** **Nunca**
   restaurar backups `.ctz` para crear proyectos. **(verificado: `MCP_Create_Test` abre en Studio y en Graphics Builder
   y compila)**
 - `po_project_unregister`: quita proyectos del registro marcando sus filas de `MASTER.DBF` como borradas (`*`, como
@@ -590,9 +591,15 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
     objetos, 39 cambios)**: `LibraryObjectPutProperty` vuelve a expandir las expresiones del genie (las animaciones
     del `.ctg` guardado usan los zOL nuevos, sin `StaleZolReference` ni `leftovers`); `PageSaveAs` guarda en el
     proyecto de destino (`.ctg`/`.ctF` en su carpeta y fila en su `pages.dbf`; la de origen no cambia); Graphics
-    Builder vio los 39 cambios (esa página no tiene genies en grupos). **Sin verificar**: aplicar un clon con genies
-    dentro de grupos (el recorrido y la edición por AN de un genie agrupado sí están verificados) y un clon
-    dentro del mismo proyecto (MCP_Demo no incluye PLS_Include: ver arriba).
+    Builder vio los 39 cambios (esa página no tiene genies en grupos).
+  - **Verificado en vivo dentro del mismo proyecto (2026-11-27, `tests\live.rs oneline_clone_mismo_proyecto`)**: en
+    un proyecto creado con `po_project_create` que incluye PLS_Include y PSO_Equipment (`pls_easergy` está en
+    PSO_Equipment, no en PLS_Include), una copia de T300 clonada con `next_free` toma números por encima de los de la
+    página de origen; 18 genies y 39 propiedades editados, `ok`, y `po_oneline_validate` del proyecto sin errores
+    ni advertencias. Graphics Builder carga la lista de proyectos al abrir: con un proyecto creado después hay que
+    reabrirlo (el error lo dice). El plan (`apply=false`) también necesita `POWEROP_ALLOW_WRITE=1` (la herramienta
+    es de escritura). **Sin verificar**: un clon con genies de Advanced One-Line dentro de grupos (el recorrido y la
+    edición por AN de un genie agrupado sí están verificados).
     Después: compilar y regenerar AdvOneLine.csv con la One-Line Configuration Utility.
 
 ## 6. PLC por Modbus TCP (solo lectura)

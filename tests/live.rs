@@ -346,3 +346,42 @@ fn oneline_clone() {
     let _ = std::fs::remove_dir_all(&work);
     c.finish();
 }
+/// po_oneline_clone dentro del mismo proyecto: `MCP_OL_Test` (creado con po_project_create, incluye PLS_Include y
+/// PSO_Equipment) tiene `MCP_OL_A` (copia de SingleLinesOverview_T300). Clona A como `MCP_OL_Tmp` con next_free,
+/// verifica que no repita números de A (po_oneline_validate sin errores) y la borra. Verificado el 2026-11-27.
+/// Graphics Builder tiene que haberse abierto después de crear el proyecto (carga la lista de proyectos al abrir).
+#[test]
+#[ignore = "necesita Graphics Builder y el proyecto MCP_OL_Test con la página MCP_OL_A; escribe MCP_OL_Tmp y la borra"]
+fn oneline_clone_mismo_proyecto() {
+    let work = temp_dir("live-olc2");
+    let mut mcp = Mcp::start_live(
+        &work,
+        &[("POWEROP_PROJECT", "MCP_OL_Test".into()), ("POWEROP_TIMEOUT_SECS", "150".into()), ("POWEROP_ALLOW_WRITE", "1".into())],
+    );
+    let mut c = Checks::default();
+    let page = "MCP_OL_Tmp";
+    let _ = mcp.call("po_gb_page_delete", json!({"page": page}));
+    let args = json!({"source_page": "MCP_OL_A", "page": page, "renumber": "next_free",
+                      "replace": [{"from": "MA_T300_", "to": "MCP_T303_"}]});
+    let (e, t) = mcp.call("po_oneline_clone", args.clone());
+    show("oneline_clone (plan)", &t);
+    let plan = if e { json!({}) } else { json_of(&t) };
+    c.check("plan con cambios y sin librerías faltantes", plan["total_changes"].as_u64().unwrap_or(0) > 0
+        && plan["missing_libraries"] == json!([]), &t);
+    let mut args = args;
+    args["apply"] = json!(true);
+    let (e, t) = mcp.call("po_oneline_clone", args);
+    show("oneline_clone (apply)", &t);
+    let j = if e { json!({}) } else { json_of(&t) };
+    let v = &j["verification"];
+    c.check("verificación ok", !e && v["ok"] == true && v["applied_as_planned"] == true && v["new_findings"] == json!([])
+        && v["leftovers"] == json!([]), &t);
+    let (e, t) = mcp.call("po_oneline_validate", json!({}));
+    c.check("sin errores ni advertencias en el proyecto (A y la copia no comparten números)",
+        !e && json_of(&t)["summary"]["errors"] == 0 && json_of(&t)["summary"]["warnings"] == 0, &t);
+    let (e, t) = mcp.call("po_gb_page_delete", json!({"page": page}));
+    c.check("page_delete", !e, &t);
+    drop(mcp);
+    let _ = std::fs::remove_dir_all(&work);
+    c.finish();
+}
