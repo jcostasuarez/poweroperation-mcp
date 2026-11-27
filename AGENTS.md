@@ -7,8 +7,8 @@ sobre `src\procs.rs`), proyecto offline por DBF/Cicode (`src\tools\project.rs`),
 (`src\tools\dbfwrite.rs` sobre `src\dbf.rs` y `src\ndx.rs`), creación de proyectos (`src\tools\projcreate.rs`),
 compilación (`src\tools\projadmin.rs`), proyecto activo de Studio (`src\tools\studio.rs`: UI Automation, citect.ini),
 Graphics Builder por COM (`src\tools\graphics.rs` sobre `src\gb.rs`), Advanced One-Line offline
-(`src\tools\oneline.rs` sobre `src\oneline.rs`, `src\oneline_clone.rs` (renumeración de `po_oneline_clone`) y el lector de `.ctg` `src\ctg.rs`: formato deducido de páginas
-reales, ver su cabecera) y la referencia para el agente (`src\tools\reference.md`, embebida), PLC por Modbus TCP solo lectura (`src\tools\plc.rs`
+(`src\tools\oneline.rs` sobre `src\oneline.rs`, `src\oneline_clone.rs` (renumeración de `po_oneline_clone`) y el lector de `.ctg` `src\ctg.rs`: contenedor sacado de `Ctg32.dll`,
+contenido de los objetos deducido de páginas reales, ver su cabecera) y la referencia para el agente (`src\tools\reference.md`, embebida), PLC por Modbus TCP solo lectura (`src\tools\plc.rs`
 sobre `src\modbus.rs`) y `po_status` + sondeo de puentes (`src\tools\status.rs`). `src\argerr.rs` arma los errores
 de argumentos (campos válidos + esquema) desde `call_tool` en `src\server.rs`.
 
