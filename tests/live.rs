@@ -385,3 +385,79 @@ fn oneline_clone_mismo_proyecto() {
     let _ = std::fs::remove_dir_all(&work);
     c.finish();
 }
+
+/// po_oneline_clone con genies del Advanced One-Line dentro de grupos (también anidados), en `MCP_OL_Test`: clona
+/// `MCP_OL_A` como `MCP_OL_G` (next_free), agrupa dos interruptores y mete ese grupo con una barra en otro grupo,
+/// clona `MCP_OL_G` como `MCP_OL_GC` y verifica que Graphics Builder editó los genies agrupados como dice el plan.
+/// Borra las dos páginas.
+#[test]
+#[ignore = "necesita Graphics Builder y el proyecto MCP_OL_Test con la página MCP_OL_A; escribe MCP_OL_G y MCP_OL_GC y las borra"]
+fn oneline_clone_grupos() {
+    let work = temp_dir("live-olc3");
+    let mut mcp = Mcp::start_live(
+        &work,
+        &[("POWEROP_PROJECT", "MCP_OL_Test".into()), ("POWEROP_TIMEOUT_SECS", "150".into()), ("POWEROP_ALLOW_WRITE", "1".into())],
+    );
+    let mut c = Checks::default();
+    let (pg, pc) = ("MCP_OL_G", "MCP_OL_GC");
+    for p in [pc, pg] {
+        let _ = mcp.call("po_gb_page_delete", json!({"page": p}));
+    }
+    let (e, t) = mcp.call("po_oneline_clone", json!({"source_page": "MCP_OL_A", "page": pg, "renumber": "next_free", "apply": true,
+                                                       "replace": [{"from": "MA_T300_", "to": "MCP_T304_"}]}));
+    c.check("copia MCP_OL_G", !e && json_of(&t)["verification"]["ok"] == true, &t);
+
+    let objs = |mcp: &mut Mcp, page: &str| -> Vec<Value> {
+        let (_, t) = mcp.call("po_gb_page_read", json!({"page": page}));
+        serde_json::from_str::<Value>(&t).ok().and_then(|j| j["objects"].as_array().cloned()).unwrap_or_default()
+    };
+    let has = |o: &Value, prop: &str| o["properties"][prop].as_str().is_some_and(|v| v.trim().parse::<u32>().is_ok_and(|n| n > 0));
+    let o = objs(&mut mcp, pg);
+    let bkrs: Vec<i64> = o.iter().filter(|o| has(o, "BkrNum")).filter_map(|o| o["an"].as_i64()).take(2).collect();
+    let bus = o.iter().find(|o| has(o, "BusbarNum") && !has(o, "BkrNum")).and_then(|o| o["an"].as_i64());
+    c.check("dos interruptores y una barra", bkrs.len() == 2 && bus.is_some(), &format!("{bkrs:?} {bus:?}"));
+    if bkrs.len() == 2 && let Some(bus) = bus {
+        let (e, t) = mcp.call("po_gb_page_edit", json!({"page": pg, "ops": [{"op": "group", "ans": bkrs}]}));
+        c.check("agrupa los interruptores", !e, &t);
+        let o = objs(&mut mcp, pg);
+        let inner = o.iter().find(|x| x["an"] == bkrs[0]).cloned().unwrap_or_default();
+        let g1 = o.iter().find(|x| x["class"] == "Group" && x["path"] == inner["group"]).and_then(|x| x["an"].as_i64());
+        c.check("el grupo tiene AN", g1.is_some(), &format!("{inner}"));
+        if let Some(g1) = g1 {
+            let (e, t) = mcp.call("po_gb_page_edit", json!({"page": pg, "ops": [{"op": "group", "ans": [g1, bus]}]}));
+            c.check("grupo anidado (grupo + barra)", !e, &t);
+        }
+        let o = objs(&mut mcp, pg);
+        let depth = |an: i64| o.iter().find(|x| x["an"] == an).and_then(|x| x["group"].as_array().map(|g| g.len())).unwrap_or(0);
+        println!("\n===== profundidad: bkr {} {}, bus {}", depth(bkrs[0]), depth(bkrs[1]), depth(bus));
+        c.check("interruptores a profundidad 2 y barra a 1", depth(bkrs[0]) == 2 && depth(bkrs[1]) == 2 && depth(bus) == 1, "");
+    }
+
+    let args = json!({"source_page": pg, "page": pc, "renumber": "next_free", "replace": [{"from": "MCP_T304_", "to": "MCP_T305_"}]});
+    let (e, t) = mcp.call("po_oneline_clone", args.clone());
+    show("oneline_clone grupos (plan)", &t);
+    let planned = if e { 0 } else { json_of(&t)["total_changes"].as_u64().unwrap_or(0) };
+    let mut args = args;
+    args["apply"] = json!(true);
+    let (e, t) = mcp.call("po_oneline_clone", args);
+    show("oneline_clone grupos (apply)", &t);
+    let j = if e { json!({}) } else { json_of(&t) };
+    let v = &j["verification"];
+    println!("\n===== graphics_builder\n{:#}\n===== verification\n{:#}", j["graphics_builder"], v);
+    c.check("Graphics Builder ve todos los cambios del plan", planned > 0 && j["graphics_builder"]["properties_set"].as_u64() == Some(planned), &t);
+    c.check("verificación ok", !e && v["ok"] == true && v["applied_as_planned"] == true && v["new_findings"] == json!([])
+        && v["leftovers"] == json!([]), &t);
+    let o = objs(&mut mcp, pc);
+    c.check("la copia conserva los grupos", o.iter().filter(|x| x["class"] == "Group" && x["path"].as_array().is_some()).count() >= 2, "");
+    let (e, t) = mcp.call("po_oneline_validate", json!({}));
+    c.check("sin errores ni advertencias en el proyecto", !e && json_of(&t)["summary"]["errors"] == 0 && json_of(&t)["summary"]["warnings"] == 0, &t);
+    if !std::env::var("POWEROP_LIVE_KEEP").is_ok_and(|v| v == "1") {
+        for p in [pc, pg] {
+            let (e, t) = mcp.call("po_gb_page_delete", json!({"page": p}));
+            c.check(&format!("borra {p}"), !e, &t);
+        }
+    }
+    drop(mcp);
+    let _ = std::fs::remove_dir_all(&work);
+    c.finish();
+}

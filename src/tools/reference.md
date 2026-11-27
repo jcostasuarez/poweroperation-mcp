@@ -451,8 +451,8 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
 - En `po_gb_page_read`, `x2`/`y2` son la coordenada del extremo opuesto (no el tamaño). Los objetos `Genie`/`Symbol`
   traen `library_object` (proyecto, librería, elemento) y los genies sus propiedades.
 - **Grupos (verificado el 2026-11-27, `tests\live.rs gb_write`)**: un grupo tiene AN propio y clase `Group`;
-  `po_gb_page_read` entra en él (`PageSelectFirstObjectInGroup`/`NextObjectInGroup`; los anidados también, sin
-  probar) y lo devuelve con `path` y `children`; sus objetos van a continuación con `group` = el `path` del grupo. Un genie
+  `po_gb_page_read` entra en él (`PageSelectFirstObjectInGroup`/`NextObjectInGroup`; los anidados también,
+  verificado en `tests\live.rs oneline_clone_grupos`) y lo devuelve con `path` y `children`; sus objetos van a continuación con `group` = el `path` del grupo. Un genie
   agrupado se edita por su AN (`set_genie_properties`, verificado). Los objetos ocultos (`visible_when`) se listan
   igual. `visible_when` sobre un genie dentro de un grupo dio E_HANDLE (0x80070006); sobre el grupo y sobre un texto
   funciona. En `SingleLinesOverview_T300` hay dos objetos sin AN ni clase que no son grupos (E_HANDLE al entrar):
@@ -598,8 +598,12 @@ no lo cierra. Todo lo de esta sección está **(verificado)** en PO 2024, salvo 
     página de origen; 18 genies y 39 propiedades editados, `ok`, y `po_oneline_validate` del proyecto sin errores
     ni advertencias. Graphics Builder carga la lista de proyectos al abrir: con un proyecto creado después hay que
     reabrirlo (el error lo dice). El plan (`apply=false`) también necesita `POWEROP_ALLOW_WRITE=1` (la herramienta
-    es de escritura). **Sin verificar**: un clon con genies de Advanced One-Line dentro de grupos (el recorrido y la
-    edición por AN de un genie agrupado sí están verificados).
+    es de escritura).
+  - **Verificado en vivo con grupos (2026-11-27, `tests\live.rs oneline_clone_grupos`)**: en una copia de T300 con
+    dos interruptores en un grupo y ese grupo junto con una barra dentro de otro (interruptores a profundidad 2),
+    Graphics Builder vio y editó los 39 cambios del plan (18 genies), el `.ctg` guardado coincide con el plan
+    (`applied_as_planned`, sin `leftovers`), la copia conserva los dos grupos y `po_oneline_validate` del proyecto
+    queda sin errores ni advertencias. El lector offline del `.ctg` también ve los genies anidados.
     Después: compilar y regenerar AdvOneLine.csv con la One-Line Configuration Utility.
 
 ## 6. PLC por Modbus TCP (solo lectura)
